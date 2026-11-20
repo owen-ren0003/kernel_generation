@@ -1,0 +1,416 @@
+===============================================================================
+Cloning Repositories and Obtaining Bisheng Compiler
+===============================================================================
+
+This file describes how to obtain every external piece needed to build and
+deploy our test environment from scratch on a fresh machine. It covers:
+
+  1. Cloning the five core repos (FlagGems public mirror, FlagGems_Ascend
+     internal, triton-ascend, AscendNPU-IR-Dev, hivmc).
+  2. Initializing submodules (LLVM forks + triton third-party).
+  3. Obtaining the bisheng compiler (toolkit-bundled vs standalone .run).
+  4. Other dependent artifacts (CANN .run files, wheel cache, libdevice.bc).
+
+Conventions:
+  <REPO_ROOT> — the parent directory containing all clones. Example values:
+    /path/to/ascend-workspaces/ws1   (current WSL build host layout)
+    ~/projects/ascend     (any other host)
+  Current Codex harness config maps the parent work directory
+  `/path/to/ascend-workspaces` to `/src`, so ws1 appears inside Docker
+  as `/src/ws1`. Older one-workspace Docker layouts mapped <REPO_ROOT>
+  directly to `/src`; prefer the current config.yaml + docker-setup.txt layout.
+
+Network reachability summary (verified):
+  WSL build host   — gitcode.com, Huawei codehub work via an authorized proxy.
+                     OBS works with --no-check-certificate.
+  A5 primary, A5 secondary, Conda NPU host  — none of the above reachable directly. Always rsync /
+                     scp from WSL.
+
+
+===============================================================================
+1. Cloning the core repositories
+===============================================================================
+
+All five live under <REPO_ROOT>/ side-by-side. Branch convention:
+
+    AscendNPU-IR-Dev    A5/dev   (was master)
+    hivmc               A5/dev   (was master)
+    triton-ascend       release/3.5.x
+    FlagGems            main     (public mirror)
+    FlagGems_Ascend     master   (internal Huawei mirror)
+
+--- a) FlagGems (public mirror, gitcode) ---
+
+  Use this if you only need the public FlagGems API surface without any of
+  Huawei's Ascend-specific runtime bits.
+
+    cd <REPO_ROOT>
+    git clone https://gitcode.com/Ascend/FlagGems.git
+    cd FlagGems
+    git checkout main
+
+--- b) triton-ascend ---
+
+  Triton frontend with the Ascend backend. Uses release/3.5.x as the active
+  branch (NOT master; main has different content).
+
+    cd <REPO_ROOT>
+    git clone -b release/3.5.x https://gitcode.com/Ascend/triton-ascend.git
+    cd triton-ascend
+    git log --oneline -1   # should show release/3.5.x HEAD
+
+  Periodic update:
+    cd <REPO_ROOT>/triton-ascend && git pull --ff-only origin release/3.5.x
+
+--- c) FlagGems_Ascend (internal Huawei mirror) ---
+
+  This is the FlagGems variant tests actually run against — has Ascend
+  runtime backend in src/flag_gems/runtime/backend/_ascend/. Internal
+  Huawei codehub auth required.
+
+    cd <REPO_ROOT>
+    git clone https://codehub.example.org/innersource/FlagGems_Ascend_G/FlagGems_Ascend.git
+    cd FlagGems_Ascend
+    git checkout master
+
+  If certificate verification fails (the configured proxy CA quirks):
+    GIT_SSL_NO_VERIFY=true git pull
+
+  Login: codehub.example.org expects your Huawei W3 / SSO. If clone
+  fails, verify the cert chain is in your /path/to/ca-bundle.pem.
+
+--- d) AscendNPU-IR-Dev ---
+
+  The Triton-to-Ascend MLIR compiler. Branch: A5/dev. Includes submodules
+  for LLVM and the Triton third-party tree.
+
+  Convention: clone from the FORK (YOUR_GITCODE_USER/AscendNPU-IR-Dev) so that
+  `origin` is the fork and `git push` lands fix branches there for upstream
+  MRs. Then add the canonical Ascend repo as `upstream` so we can pull
+  the latest A5/dev with `git fetch upstream A5/dev`.
+
+    cd <REPO_ROOT>
+    git clone https://gitcode.com/YOUR_GITCODE_USER/AscendNPU-IR-Dev.git
+    cd AscendNPU-IR-Dev
+    git remote add upstream https://gitcode.com/Ascend/AscendNPU-IR-Dev.git
+    git fetch upstream A5/dev
+    git push origin refs/remotes/upstream/A5/dev:refs/heads/A5/dev --force-with-lease
+    git fetch origin A5/dev
+    git switch -C A5/dev origin/A5/dev
+    git submodule update --init --recursive --progress
+
+  Authenticate through your local Git credential helper.
+
+  End-state remotes (verify with `git remote -v`):
+    origin    https://gitcode.com/YOUR_GITCODE_USER/AscendNPU-IR-Dev.git
+    upstream  https://gitcode.com/Ascend/AscendNPU-IR-Dev.git
+
+  Keeping the fork in sync with upstream:
+
+    origin/A5/dev is your fork mirror of Ascend's canonical A5/dev.
+    This branch is allowed to be overwritten so it exactly matches
+    upstream/A5/dev. Do NOT apply this rule to master or feature branches.
+
+    Prefer the local equivalent of GitCode's "sync fork" button: fetch the
+    canonical branch, then push that remote-tracking ref directly to the fork.
+    This avoids rebasing or mutating a local A5/dev branch just to sync the
+    fork.
+
+      git fetch upstream A5/dev
+      git push origin refs/remotes/upstream/A5/dev:refs/heads/A5/dev --force-with-lease
+
+    Use plain --force only if --force-with-lease rejects and you have
+    explicitly confirmed that origin/A5/dev should still be overwritten.
+
+    After syncing the fork, base local build/fix branches on the synced A5/dev:
+
+      git fetch origin A5/dev
+      git switch -C A5/dev origin/A5/dev
+
+  Submodules (cloned automatically by the recursive update above):
+    third-party/llvm-project   ← https://github.com/llvm/llvm-project.git
+    third-party/triton         ← https://github.com/triton-lang/triton.git
+
+  Both are GitHub repos. Through Huawei netentsec, plain HTTPS works.
+
+--- e) hivmc ---
+
+  The HIVM compiler that bishengir-compile invokes. Internal Huawei host.
+  Submodule needs the HUAWEI LLVM FORK (not vanilla llvm-project).
+
+    cd <REPO_ROOT>
+    git clone https://codehub.example.org/CompilerKernel/BiShengCompiler/hivmc.git
+    cd hivmc
+    git checkout A5/dev
+
+  IMPORTANT — submodule has SSH origin. Init with HTTPS to avoid SSH key setup:
+
+    cd hivmc/third-party
+    rm -rf llvm-project        # in case the SSH submodule init created an empty dir
+    git clone --branch huawei/csi/BiSheng_Enterprise/AscendNPU_IR/19.1.7 \
+      https://codehub.example.org/OpenSourceCenter/llvm/llvm-project.git
+
+  Verify the LLVM fork branch:
+    cd <REPO_ROOT>/hivmc/third-party/llvm-project
+    git branch --show-current   # must be huawei/csi/BiSheng_Enterprise/...
+
+  CRITICAL: Huawei LLVM must be cloned IN PLACE (NOT symlinked from another
+  llvm-project clone). The build picks up Huawei-specific patches that aren't
+  in vanilla llvm-project.
+
+
+===============================================================================
+1.5. Faster re-cloning when an existing clone is already on the host
+===============================================================================
+
+When provisioning a new workspace (e.g. ws5) and one of ws1/ws2/ws3 already
+has the same repo cloned, use `--reference --dissociate` to skip the network
+re-fetch while keeping the new clone fully independent. This is purely an
+OPTIMIZATION — same end state as a plain clone, just avoids re-downloading
+~7 GB through the proxy.
+
+Why two flags:
+  --reference <local-path>   At clone time, read missing objects from
+                             <local-path>/.git/objects/ instead of pulling
+                             over the network. Adds an entry in the new
+                             clone's .git/objects/info/alternates pointing
+                             at <local-path>.
+
+  --dissociate               After --reference reads the objects, COPY them
+                             into the new clone's own .git/objects/, then
+                             remove the alternates file. End state: new
+                             clone is self-contained — it can survive the
+                             reference path being deleted, gc'd, or moved.
+
+Without --dissociate, the new clone permanently depends on the reference
+clone existing. If anyone runs `git gc` in ws1, the ws5 clone breaks.
+Always use both flags together unless you have a specific reason not to.
+
+Examples:
+
+  # AscendNPU-IR-Dev main repo:
+  cd <REPO_ROOT>
+  git clone --reference <EXISTING_REPO_ROOT>/AscendNPU-IR-Dev --dissociate \
+            https://gitcode.com/YOUR_GITCODE_USER/AscendNPU-IR-Dev.git
+  cd AscendNPU-IR-Dev
+  git remote add upstream https://gitcode.com/Ascend/AscendNPU-IR-Dev.git
+  git fetch upstream A5/dev
+  git push origin refs/remotes/upstream/A5/dev:refs/heads/A5/dev --force-with-lease
+  git fetch origin A5/dev
+  git switch -C A5/dev origin/A5/dev
+
+  # Submodule init can ALSO use --reference via git submodule:
+  git -c submodule.recurse=true submodule update --init --recursive \
+      --reference=<EXISTING_REPO_ROOT>/AscendNPU-IR-Dev --dissociate
+  # (--reference here gives a hint to git submodule init to look for
+  #  matching submodule paths under that reference root.)
+
+  # hivmc Huawei LLVM fork:
+  cd hivmc/third-party
+  rm -rf llvm-project
+  git clone --reference <EXISTING_REPO_ROOT>/hivmc/third-party/llvm-project \
+            --dissociate \
+            --branch huawei/csi/BiSheng_Enterprise/AscendNPU_IR/19.1.7 \
+            https://codehub.example.org/OpenSourceCenter/llvm/llvm-project.git
+
+Disk / time tradeoff (for context):
+
+  Method                       Network         Final disk    Independent?
+  ----------------------------  --------------  ------------  ------------
+  plain `git clone`             ~7 GB pulled    ~7 GB         yes
+  `--reference` only            ~10 MB delta    ~10 MB        NO (depends on ref)
+  `--reference --dissociate`    ~10 MB delta    ~7 GB         yes
+
+For us: the dissociate variant is ~25 minutes faster than a plain clone
+on each new workspace and produces a working tree identical in
+correctness to a fresh clone. Use it.
+
+When NOT to use --reference:
+  * The reference clone is on a different filesystem with corruption you
+    haven't audited.
+  * You suspect the reference clone has had its history rewritten
+    (force-pushed branches, etc.) — start fresh.
+  * Symlink-style sharing (the actual filesystem trees pointed at the same
+    .git/objects) — that's a different antipattern; see the symlink ban
+    on the Huawei LLVM fork above. --reference is NOT a symlink: each
+    clone owns its own working tree.
+
+
+===============================================================================
+2. Submodules and patches
+===============================================================================
+
+AscendNPU-IR-Dev expects patches to be applied to its third-party/llvm-project
+and third-party/triton during the first build. The build script handles this
+via `--apply-patches` — see build-ascend-npu-ir.txt. NEVER use --apply-patches
+twice (creates conflicting state).
+
+To verify patches are clean:
+    cd <REPO_ROOT>/AscendNPU-IR-Dev/third-party/llvm-project && git diff --stat HEAD
+    cd <REPO_ROOT>/AscendNPU-IR-Dev/third-party/triton && git diff --stat HEAD
+
+If you need to redo patches, reset submodules first:
+    cd <REPO_ROOT>/AscendNPU-IR-Dev/third-party/llvm-project && git reset --hard HEAD && git clean -fdx
+    cd <REPO_ROOT>/AscendNPU-IR-Dev/third-party/triton && git reset --hard HEAD && git clean -fdx
+    # Then re-run build with --apply-patches.
+
+hivmc has no patch step — its submodule (the Huawei LLVM fork) is already at
+the right branch and ready to build directly.
+
+
+===============================================================================
+3. Obtaining the bisheng compiler
+===============================================================================
+
+bisheng (CCEC) is the proprietary final-stage compiler. We CANNOT build it.
+Three sources, in preference order:
+
+--- (a) From the CANN toolkit installer (recommended for CANN 9.1.0+) ---
+
+  bisheng is bundled inside Ascend-cann-toolkit_<version>_linux-x86_64.run.
+  After install you'll find it at:
+
+    <INSTALL_PREFIX>/cann-<version>/tools/bisheng_compiler/bin/bisheng
+    <INSTALL_PREFIX>/cann-<version>/x86_64-linux/ccec_compiler/bin/bisheng
+    (same binary, two paths — md5 d081ad58... for CANN 9.1.0.B010)
+
+  On A5 primary/A5 secondary the host already has a CANN install at:
+    /data/pri/Ascend/9.1.0.B010/cann-9.1.0/...
+
+  Download the .run file from OBS (works through the configured proxy):
+
+    OBS_BASE=https://ascend-repo.obs.cn-east-2.myhuaweicloud.com
+    wget --no-check-certificate \
+        "$OBS_BASE/CANN/CANN%209.0.T511/Ascend-cann-toolkit_9.0.0-beta.2_linux-x86_64.run"
+    # For 9.1.0 (used on A5 primary/A5 secondary):
+    # filename pattern: Ascend-cann-toolkit_9.1.0_linux-x86_64.run under
+    # CANN/CANN%209.1.0/  — confirm exact filename via the OBS console.
+
+  See docker-setup.txt and permanent-test-env.txt for which CANN is in use
+  on which machine.
+
+--- (b) Standalone bisheng-compiler .run (used on Conda NPU host) ---
+
+  When the toolkit's bundled bisheng is too old (e.g. CANN 8.5 + newer
+  hivmc on Conda NPU host), use the standalone bisheng package:
+
+    cann-bisheng-compiler_9.0.0_linux-x86_64.run
+
+  Download URL (verified):
+    $OBS_BASE/CANN/CANN%209.0.T511/cann-bisheng-compiler_9.0.0_linux-x86_64.run
+
+  Extract:
+    chmod +x cann-bisheng-compiler_9.0.0_linux-x86_64.run
+    ./cann-bisheng-compiler_9.0.0_linux-x86_64.run --noexec --target ./bisheng_compiler
+
+  After extraction, ./bisheng_compiler/bisheng_compiler/bin/ contains:
+    bisheng, ccec (symlink to bisheng), cce-ld, lld, ld.lld, llvm-link,
+    llvm-ar, bisheng-tune
+
+  We keep the extracted tree at <REPO_ROOT>/bisheng_compiler/.
+
+--- (c) Existing extraction from a CI container (legacy fallback) ---
+
+  Useful for one-off pulls without redownloading the .run:
+
+    # From a running CI container on A5 primary / A5 secondary:
+    CONTAINER=$(docker ps --format '{{.Names}}' | grep triton_CI_op | head -1)
+    docker exec $CONTAINER \
+        ls /data/autotest/optest_fast_pipeline/*/test/bisheng/tools/bishengir/bin/bisheng
+
+    # From the host CANN install (recommended for current versions):
+    scp npu-user@a5-primary.example.org:/data/pri/Ascend/9.1.0.B010/cann-9.1.0/tools/bisheng_compiler/bin/bisheng <dest>
+
+The OLD ad-hoc dirs on Conda NPU host (/home/npu-user/bin_bak, bin_bak2, bin_blue*)
+are obsolete and being deleted — use the permanent test env at
+/home/npu-user/permanent_pipeline/builds/dev_reference/ instead.
+
+
+===============================================================================
+4. Other dependent artifacts
+===============================================================================
+
+--- CANN package .run files (toolkit + ops + nnal) ---
+
+  Same OBS bucket as bisheng. For CANN 9.0.T511 (used in our v1 prototype):
+    Ascend-cann-toolkit_9.0.0-beta.2_linux-x86_64.run    (~961 MiB)
+    Ascend-cann-950-ops_9.0.0-beta.2_linux-x86_64.run    (~2.2 GiB)  Atlas 350
+    Ascend-cann-A3-ops_9.0.0-beta.2_linux-x86_64.run                 Atlas A3
+    Ascend-cann-910b-ops_9.0.0-beta.2_linux-x86_64.run               910B
+    Ascend-cann-nnal_9.0.0-beta.2_linux-x86_64.run       (~538 MiB)
+
+  Architecture: linux-x86_64 for our build hosts (verified). For aarch64
+  hosts swap "linux-x86_64" → "linux-aarch64" in URLs.
+
+  The current (v2) flow does NOT install CANN inside the image — it
+  bind-mounts CANN from the host's /data/pri/Ascend/. See
+  permanent-test-env.txt for that pattern.
+
+--- libdevice.10.bc ---
+
+  Required by triton-ascend at the bishengir-compile call site. NOT shipped
+  by the triton-ascend wheel — must be obtained separately.
+
+  Sources, in preference order:
+    1. A5 primary's permanent container, at the canonical Triton path:
+         /usr/local/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc
+       Pull with:
+         ssh npu-user@a5-primary.example.org \
+           "docker cp ascend_test_env:/usr/local/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc /tmp/libdevice.10.bc"
+         scp npu-user@a5-primary.example.org:/tmp/libdevice.10.bc <dest>
+    2. Anybody else's working triton-ascend install on the same host:
+         find / -name 'libdevice.10.bc' -path '*triton/backends/ascend/lib*'
+
+  Place at:
+    <CONDA_PREFIX>/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc
+
+--- Python wheel cache (/data/whls equivalent) ---
+
+  /data/whls on A5 primary has 28 wheels (torch CPU, pybind11, pytest, numpy,
+  scipy, FlagGems deps, etc.) used for offline pip installs. A5 secondary doesn't
+  have it natively — must be transferred from A5 primary:
+
+    ssh npu-user@a5-primary.example.org "tar cf - -C /data whls" | \
+        ssh npu-user@<dest_host> "cd /home/npu-user && tar xf -"
+
+  Newer triton-ascend / torch-npu wheels live at /data/ci_env/ on each
+  machine (Jenkins-published nightly). Always pull the NEWER pair from
+  A5 primary's /data/ci_env/ if A5 secondary's are too old (verified the older ones break
+  against CANN 9.1.0 — see permanent-test-env.txt §A5 secondary GOTCHAS).
+
+--- Hivmc-built .bc files ---
+
+  hivmc's build produces meta_op*.bc (chip-kernel templates), host.bc, and
+  regbaseM300.bc under tools/bishengir/lib/Template/. The runtime expects
+  the meta_op files RENAMED with a "dav-" prefix:
+    meta_op.aiv.c310.bc  →  meta_op.aiv.dav-c310.bc
+
+  See deploy-and-test.txt §"Deploying hivmc .bc Files" for the rename loop.
+
+--- Docker base image (ubuntu:22.04) ---
+
+  WSL Docker can't always pull from docker.io directly. Workaround — import
+  from cloud-images.ubuntu.com (works through the configured proxy):
+
+    wget --no-check-certificate -O /tmp/jammy.tar.xz \
+      https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-amd64-root.tar.xz
+    docker import /tmp/jammy.tar.xz ubuntu:22.04
+
+  See docker-setup.txt and permanent-test-env.txt for the full container
+  build flow.
+
+
+===============================================================================
+Quick checklist: fresh-machine bootstrap
+===============================================================================
+
+  1.  mkdir -p <REPO_ROOT> && cd <REPO_ROOT>
+  2.  Clone all five repos (§1 above), checkout right branches.
+  3.  Init submodules in AscendNPU-IR-Dev. Manually clone Huawei LLVM fork
+      into hivmc/third-party/llvm-project.
+  4.  Download bisheng compiler .run (or extract from existing CANN install).
+  5.  Download CANN .run files if rebuilding the v1 image. (v2 image
+      bind-mounts CANN from host instead — see permanent-test-env.txt.)
+  6.  scp libdevice.10.bc + /data/whls + /data/ci_env wheels from .152.
+  7.  Build per build-ascend-npu-ir.txt + build-hivmc.txt.
+  8.  Deploy per deploy-and-test.txt + permanent-test-env.txt.

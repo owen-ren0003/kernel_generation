@@ -1,0 +1,59 @@
+# Shareable example. Copy to config.local.yaml and set your local paths/hosts.
+
+task_id: ""
+parallel_slots: 3
+
+work_dir: /path/to/ascend-workspaces
+
+workspaces:
+  - { id: 1, name: ws1 }
+  - { id: 2, name: ws2 }
+  - { id: 3, name: ws3 }
+  - { id: m, name: master, role: integration }
+
+reference_repos:
+  ascend_npu_ir_dev: ""
+  hivmc: ""
+
+default_branches:
+  ascend_npu_ir_dev: A5/dev
+  hivmc: A5/dev
+
+default_branch: A5/dev
+
+disk_budget:
+  warn_threshold_gb: 50
+  hard_threshold_gb: 70
+
+mass_test_window:
+  start_hour: 9
+  end_hour: 17
+  timezone: local
+
+test_env:
+  mode: conda
+  host: user@your-npu-host
+  pipeline_root: /path/to/permanent_pipeline
+  container: ""
+  flaggems_test_dir: /path/to/FlagGems_Ascend
+  dt_debug_template: "{pipeline_root}/dt_debug_{ws_name}"
+  enforce_mass_test_window: false
+  target_arch: Ascend910_9589
+
+docker:
+  container: ascend-build
+  bind_host_path: /path/to/ascend-workspaces
+  bind_container_path: /src
+
+commands:
+  pre_fix: "bash scripts/run-tests.sh --slot dev_reference --test '<pytest-node-id>'"
+  post_fix: "bash scripts/run-tests.sh --slot fix_bin --test '<pytest-node-id>'"
+  regression: "bash scripts/run-tests.sh --slot fix_bin --tests state/regression-sample.txt"
+
+task_state_dir: state/tasks/{task_id}
+active_fixes: state/tasks/{task_id}/active-fixes.json
+master_fixes: state/tasks/{task_id}/master-fixes.json
+issues_dir: state/tasks/{task_id}/issues
+failures_xlsx: .local-artifacts/{task_id}/failures-latest.xlsx
+categories: state/tasks/{task_id}/categories.yaml
+ir_dump_dir: .local-artifacts/{task_id}/gen_ir

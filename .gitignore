@@ -1,0 +1,22 @@
+# Machine-specific configuration, credentials, and credential backups.
+/config.local.yaml
+/instructions/login-credentials*
+!/instructions/login-credentials.example.txt
+.env
+.env.*
+!.env.example
+
+# Runtime history stays local; only the storage-policy README is shared.
+/state/*
+!/state/README.md
+/.local-artifacts/
+
+# Local environments, generated builds, and tool caches.
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+/build*/
+/build.ninja
+/.ninja_*
+/D:*

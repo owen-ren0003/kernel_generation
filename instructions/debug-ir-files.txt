@@ -1,0 +1,117 @@
+===============================================================================
+Debugging with IR Files
+===============================================================================
+
+=== Generating IR Dumps ===
+
+  Add these flags to bishengir-compile command line:
+
+  --mlir-print-ir-after-all       Print IR after every pass (VERY verbose)
+  --mlir-print-ir-before-all      Print IR before every pass
+  --mlir-print-ir-after=<pass>    Print IR after a specific pass
+  --mlir-print-ir-before=<pass>   Print IR before a specific pass
+
+  Pass names use kebab-case, e.g.:
+    --mlir-print-ir-after=convert-arith-to-hfusion
+    --mlir-print-ir-after=hfusion-legalize-bool
+    --mlir-print-ir-after=convert-hfusion-to-hivm
+    --mlir-print-ir-after=hivm-inject-sync
+    --mlir-print-ir-after=convert-ascend-dpx-to-hivmregbaseintrins
+
+  Output goes to STDERR. Redirect:
+    bishengir-compile <args> 2>/tmp/ir_dump.log
+
+  To print only specific functions in the dump, use:
+    --mlir-print-ir-module-scope    Print full module (not just changed function)
+
+  Other useful flags:
+    --mlir-disable-threading        Deterministic pass ordering for debugging
+    --mlir-print-op-generic         Print generic form (shows all attributes)
+    --mlir-print-debuginfo          Include source location info
+
+=== Finding the Correct Input IR ===
+
+  The Triton compiler produces intermediate IR files in the triton cache:
+
+  1. Find cache directory:
+     /root/.triton/cache/  (inside Docker containers)
+     ~/.triton/cache/      (on Conda NPU host with conda)
+
+  2. Each kernel has its own cache subdirectory with:
+     - <kernel>.ttir       Triton IR (input to compiler)
+     - <kernel>.ttadapter  Linalg/tensor IR (input to bishengir-compile)
+     - <kernel>.npubin     Compiled binary
+     - <kernel>.json       Compilation metadata (flags, target, etc.)
+
+  3. To identify the failing kernel, check the .json for kernel_name:
+     cat <hash>/<kernel>.json | python3 -m json.tool | head -20
+
+  4. The .ttadapter file is the input to bishengir-compile for HIVM path.
+     The .ttir file is the input for SIMT/DPX path (force_simt_only=True).
+
+=== Manually Compiling a Kernel ===
+
+  For HIVM path (force_simt_only=False, e.g., sort kernel):
+    bishengir-compile <kernel>.ttadapter \
+      --target=Ascend950PR_957c \
+      --enable-hfusion-compile=true \
+      --enable-triton-kernel-compile=true \
+      --enable-auto-bind-sub-block=true \
+      --enable-vf-merge-level=1 \
+      -o /tmp/output_kernel \
+      --mlir-print-ir-after-all 2>/tmp/full_dump.log
+
+  For SIMT path (force_simt_only=True):
+    bishengir-compile <kernel>.ttir \
+      --pure-simt --use-dpx \
+      --num-warps=32 --threads-per-warp=32 \
+      --enable-bishengir-simt-optimization=111 \
+      --target=Ascend950PR_957c \
+      --enable-triton-kernel-compile \
+      -o /tmp/output_kernel \
+      --mlir-print-ir-after-all 2>/tmp/full_dump.log
+
+  NOTE: The compile will fail at the final step ("Cannot find bisheng")
+  because bisheng is not in PATH. But ALL IR passes complete successfully
+  and the dump is valid.
+
+=== Analyzing IR Dumps ===
+
+  1. List all passes:
+     grep -n "IR Dump After" /tmp/full_dump.log
+
+  2. Find specific operations:
+     grep -n "arith.select\|hfusion.compare\|hfusion.select" /tmp/full_dump.log
+
+  3. Count i1 types (should be 0 after LegalizeBool):
+     sed -n '<start>,<end>p' /tmp/full_dump.log | grep -c "xi1"
+
+  4. Check cast types:
+     grep "cast_unsigned\|cast_signed" /tmp/full_dump.log | head -20
+
+=== Key Pass Pipeline (HIVM path) ===
+
+  ConvertArithToHFusion    arith.extui/select → hfusion.cast/select
+  LegalizeBoolPass         i1 tensors → i8 tensors
+  GenericUnroller          Unroll linalg.generic
+  FlattenOps               Flatten multi-dim tensors
+  OutlineVectorFunction    Create VF (vector function) outlines
+  AutoVectorizeV2          Vectorize to 64-wide vectors
+  ConvertHFusionToHIVM     HFusion ops → HIVM ops
+  InjectSync               Add set_flag/wait_flag for pipe sync
+  ConvertAscendDPXToHIVMRegbaseIntrins   HIVM → regbase intrinsics
+  ConvertHIVMToLLVM        HIVM → LLVM dialect
+
+=== Common Bug Patterns ===
+
+  1. i1 types surviving to memory operations:
+     Look for "xi1" after LegalizeBoolPass — should be 0
+
+  2. Wrong cast sign (cast_signed vs cast_unsigned):
+     Look for "cast_signed.*xi1" — i1→anything should be cast_unsigned
+
+  3. Missing sync barriers:
+     Check if set_flag/wait_flag appear between MTE and V pipe ops
+
+  4. Wrong mask width:
+     Check pge.b32 mask values match actual data sizes

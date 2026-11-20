@@ -1,0 +1,710 @@
+===============================================================================
+Permanent FlagGems Test Environment — Setup, Update, and Use
+===============================================================================
+
+This document describes how to create OUR OWN permanent FlagGems test pipeline
+on A5 primary, A5 secondary, and Conda NPU host, independent of the daily CI pipeline (which gets
+recycled by `auto_rm.sh` and can disappear during CI churn). Goals:
+
+  i)  We always have a working test environment, even if CI containers die.
+  ii) We can update it to match new CI pipeline releases as they ship.
+
+Per-machine sections start with a banner. Common concepts are at the top.
+
+===============================================================================
+SERVER CONFIGURATION
+===============================================================================
+
+Select the authorized test host and environment in config.local.yaml. The
+Docker and Conda setups below are examples. Adapt paths and versions after
+checking the target host.
+
+===============================================================================
+NAMING CONVENTION (read deploy-and-test.txt first)
+===============================================================================
+
+The canonical naming + lifecycle rules for build and bin folders live in
+`instructions/deploy-and-test.txt`. Summary for this doc's purposes:
+
+  Bin folders (under ~/permanent_pipeline/builds/):
+    bin-<rel|debug>-<descriptor>     for built binaries
+    bin-system-<descriptor>          for stock/ticket-pinned binaries
+  Active symlink directory:
+    ~/permanent_pipeline/bin-active/  symlinks point into builds/<preset>/
+                                      setenv.bash puts this first on PATH
+  Bitcode dir (Conda NPU host conda only):
+    ~/permanent_pipeline/lib/         meta_op.*.dav-*.bc, host-a5.bc, regbaseM300.bc
+                                      MUST exist; missing → IsolatedFromAbove cascade
+
+Sections below still use the older names in places (`fix_bin/`,
+`system_bin/`, `dev_reference/`, etc.) — that's historical context preserved
+verbatim. The remote-side rename checklist at
+`upgrades/2026-05-19-remote-side-checklist.md` walks through migrating each
+machine to the new layout.
+
+===============================================================================
+PRE-FLIGHT CHECKLIST (do this BEFORE building any image)
+===============================================================================
+
+Before designing the Dockerfile, inspect a working CI container and capture:
+
+  CONTAINER=$(ssh <host> "docker ps --format '{{.Names}}' | grep triton_CI_op | head -1")
+  ssh <host> "docker exec $CONTAINER bash -c '
+    cat /etc/os-release | head -5             # base distro + version
+    ldd --version | head -1                   # glibc version
+    strings /usr/lib/x86_64-linux-gnu/libstdc++.so.6 | grep GLIBCXX | tail -3
+    which python3 && python3 --version        # python install location/version
+    ls /usr/local/Ascend/                     # what CANN is actually IN the image
+  '"
+
+Record the values. Your base image MUST have at minimum the same glibc and
+libstdc++ versions, otherwise CANN's *.so files (built against the CI's
+toolchain) will fail to dlopen with "GLIBCXX_X.X.XX not found" or
+"GLIBC_X.XX not found" errors that DON'T appear until you actually run a test.
+
+For the A5 primary / A5 secondary CI containers (verified 2026-04-28):
+    Ubuntu 22.04 (Jammy)
+    glibc 2.35
+    GLIBCXX up to 3.4.30
+    Python 3.11.13 at /usr/local/python3.11.13/
+
+The CI image itself ONLY ships CANN 8.5 in /usr/local/Ascend/. CANN 9.1.0
+(what tests actually use) lives on the HOST at /data/pri/Ascend/9.1.0.B010/
+and is bind-mounted into the container at runtime. We do the same.
+
+===============================================================================
+Common Concepts
+===============================================================================
+
+Layout (same on every machine; canonical naming per deploy-and-test.txt):
+
+    /home/npu-user/permanent_pipeline/
+        docker/                # Dockerfile, build.sh, run.sh, entrypoint.sh
+        wheels/                # torch_npu, triton_ascend, torch, pybind11, etc.
+        triton_ascend/         # cloned repo (release/3.5.x)
+            test/flaggems_cases/repo/   # FlagGems checkout (nested here on purpose)
+        builds/                # CANDIDATE compiler sets — switch_compiler.sh
+                               # repoints bin-active/'s symlinks at one of these.
+                               # Lazy creation: only the folders actually used.
+            bin-system-<descriptor>/    # stock/ticket-pinned binaries (one per
+                                        # ticket / external baseline)
+            bin-rel-<descriptor>/       # release builds from our source repos
+            bin-debug-<descriptor>/     # debug builds (symbols + assertions)
+        bin-active/            # ACTIVE compiler set — symlinks into
+                               # builds/<preset>/. setenv.bash always puts
+                               # this first on PATH (no env-var toggle).
+        lib/                   # (Conda NPU host only) bitcode files required by
+                               # bishengir-compile at runtime:
+                               #   meta_op.aic.dav-c220.bc, meta_op.aic.dav-c310.bc
+                               #   meta_op.aiv.dav-c220.bc, meta_op.aiv.dav-c310.bc
+                               #   meta_op.mix.aic.dav-c220.bc, ...
+                               #   host-a5.bc, regbaseM300.bc
+                               # MISSING → IsolatedFromAbove cascade error.
+        scripts/               # setenv.bash, switch_compiler.sh,
+                               # setup_pipeline.sh, run_one_test.sh,
+                               # update_wheels.sh, smoke_test.sh
+        gen_ir/                # IR dumps from debugging sessions
+
+Switching compiler sets (single command, no env-var toggle):
+    bash scripts/switch_compiler.sh                            # show current
+    bash scripts/switch_compiler.sh bin-system-<descriptor>    # stock/ticket
+    bash scripts/switch_compiler.sh bin-rel-dev                # latest A5/dev
+    bash scripts/switch_compiler.sh bin-rel-fix-<descriptor>   # candidate fix
+    bash scripts/switch_compiler.sh bin-debug-fix-<descriptor> # debug build
+    bash scripts/switch_compiler.sh path /abs/dir              # arbitrary dir
+
+After every switch, clear the triton cache: rm -rf ~/.triton/cache/*
+
+switch_compiler.sh contract:
+  - Accepts a preset name OR `path <abs-dir>`.
+  - Verifies the preset folder exists under builds/.
+  - For each file in builds/<preset>/: ln -sfn into bin-active/.
+  - Reports current target as `bin-active/<binary> -> builds/<preset>/<binary>`.
+  - Exit 0 on success, nonzero on missing preset.
+
+Container: image `ascend_test_env:v2`, container name `ascend_test_env`,
+`--restart=always` so it survives reboots.
+
+CANN strategy — DON'T install in image, mount from host:
+    The CI does NOT bake CANN 9.x into its image — it bind-mounts CANN from
+    /data/pri/Ascend/<version>/ at runtime. We follow the same pattern.
+    Saves ~10 GB of image size and avoids version drift between image and host.
+
+    -v /data/pri/Ascend:/data/pri/Ascend:ro
+    setenv.bash sources /data/pri/Ascend/<version>/ascend-toolkit/set_env.sh
+
+NPU device access: --privileged covers /dev/davinci*, /dev/davinci_manager,
+/dev/hisi_hdc. Driver lives on host at /usr/local/Ascend/driver, bind-mounted.
+
+CRITICAL: bishengir-compile, hivmc-a5, and bisheng (CCEC) MUST come from the
+SAME matched set. Mixing them (e.g., our fix_bin/bishengir-compile with
+CANN-bundled bisheng) causes bisheng to segfault (exit 139) on the IR
+hivmc-a5 produced. Default to the CANN-bundled trio; only swap individual
+binaries when you've ALSO verified ABI compatibility.
+
+===============================================================================
+A5 primary (CANN 9.1.0, NPU_A5, x86_64)
+===============================================================================
+
+Address: npu-user@a5-primary.example.org
+
+Network constraints (verified):
+  - A5 primary cannot reach docker.io, gitcode.com, pypi.org, archive.ubuntu.com,
+    ascend-repo.obs.* — DNS scoped.
+  - WSL CAN reach all the above through the configured proxy (proxy.example.org:8080).
+  - Strategy: build on WSL, transfer artifacts via scp/rsync, run on .152.
+
+ONE-TIME SETUP
+--------------
+
+Step 1 — Bootstrap base image on WSL (Ubuntu 22.04 to match CI):
+
+    Pull (often blocked by daemon proxy issues):
+        docker pull ubuntu:22.04
+    OR import from cloud-images.ubuntu.com (works through the configured proxy):
+        wget --no-check-certificate -O /tmp/jammy.tar.xz \
+          https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-amd64-root.tar.xz
+        docker import /tmp/jammy.tar.xz ubuntu:22.04
+
+Step 2 — Build the image on WSL:
+
+    cd /path/to/ascend-workspaces/ws1/permanent_pipeline_docker/docker
+    # Pre-download Python source (deadsnakes PPA dropped python3.11 for older
+    # distros; safer to build from source even on Jammy):
+    wget --no-check-certificate -q \
+         https://www.python.org/ftp/python/3.11.13/Python-3.11.13.tgz
+    docker build --network=host \
+        --build-arg HTTP_PROXY=$http_proxy \
+        --build-arg HTTPS_PROXY=$https_proxy \
+        --build-arg NO_PROXY=$no_proxy \
+        -t ascend_test_env:v2 .
+    # ~10-15 min; resulting image ~3 GB (NO embedded CANN).
+
+Step 3 — Save and ship to A5 primary:
+
+    docker save ascend_test_env:v2 -o /tmp/ascend_test_env_v2.tar    # ~3 GB
+    scp /tmp/ascend_test_env_v2.tar npu-user@a5-primary.example.org:/home/npu-user/permanent_pipeline/
+    # ~15 min through the configured proxy at ~3 MB/s.
+
+    On A5 primary:
+        docker load -i /home/npu-user/permanent_pipeline/ascend_test_env_v2.tar
+        rm /home/npu-user/permanent_pipeline/ascend_test_env_v2.tar  # free 3 GB
+
+Step 4 — Bootstrap pipeline folder (clones repos, copies wheels & binaries):
+
+    ssh npu-user@a5-primary.example.org
+    bash /home/npu-user/permanent_pipeline/scripts/setup_pipeline.sh
+    # gitcode.com is unreachable from .152. Pre-populate via rsync from WSL:
+
+    rsync -aHz /path/to/ascend-workspaces/ws1/triton-ascend/ \
+        npu-user@a5-primary.example.org:/home/npu-user/permanent_pipeline/triton_ascend/
+    rsync -aHz /path/to/ascend-workspaces/ws1/FlagGems_Ascend/ \
+        npu-user@a5-primary.example.org:/home/npu-user/permanent_pipeline/triton_ascend/test/flaggems_cases/repo/
+
+Step 5 — Start the long-lived container:
+
+    bash /home/npu-user/permanent_pipeline/docker/run.sh
+    # Container `ascend_test_env` is now up with --restart=always.
+    # Mounts:
+    #   /home/npu-user         (pipeline + scripts)
+    #   /usr/local/Ascend/driver (kernel-coupled driver, ro)
+    #   /data/pri/Ascend         (CANN versions, ro)
+    #   /data/whls               (wheel cache, ro)
+    #   /etc/ascend_install.info (CANN init metadata, ro)
+
+Step 6 — Install Python deps inside the container (one time):
+
+    The image only ships Python + system deps. Wheels are pip-installed from
+    the host's /data/whls cache (already populated by CI):
+
+        ssh npu-user@a5-primary.example.org
+        docker exec ascend_test_env bash -lc '
+          python3.11 -m pip install --no-index --find-links=/data/whls \
+            torch==2.7.1+cpu pybind11 \
+            pytest==8.3.2 pytest-xdist==3.6.1 psutil==6.0.0 \
+            numpy==1.26.4 scipy==1.13.1 pyyaml einops decorator attrs mpmath sympy \
+            pandas python-dateutil six packaging pluggy iniconfig
+          # And the Ascend-specific wheels:
+          for whl in /home/npu-user/permanent_pipeline/wheels/torch_npu*.whl \
+                     /home/npu-user/permanent_pipeline/wheels/triton_ascend*.whl; do
+            python3.11 -m pip install --no-deps --force-reinstall "$whl"
+          done'
+
+    `update_wheels.sh` automates the wheel refresh part on subsequent runs.
+
+Step 7 — Verify with FlagGems tests:
+
+    docker exec ascend_test_env bash -lc '
+      cd /home/npu-user/permanent_pipeline/triton_ascend/test/flaggems_cases/repo
+      rm -rf ~/.triton/cache/*
+      python3.11 -m pytest "tests/test_binary_pointwise_ops.py::test_accuracy_add_[dtype0-0.001-shape0]" --ref cpu
+    '
+
+    Expected: "1 passed". setenv.bash auto-loads via /etc/profile.d, putting
+    the right PATH, BISHENG_INSTALL_PATH, PYTHONPATH in place.
+
+UPDATING
+--------
+
+When new CI artifacts ship (typically nightly), refresh wheels in-place:
+
+    ssh npu-user@a5-primary.example.org
+    bash /home/npu-user/permanent_pipeline/scripts/update_wheels.sh /data/ci_env
+
+When triton-ascend or FlagGems get new commits, rsync from WSL:
+
+    cd /path/to/ascend-workspaces/ws1/triton-ascend && git pull
+    cd /path/to/ascend-workspaces/ws1/FlagGems_Ascend && GIT_SSL_NO_VERIFY=true git pull
+    rsync -aHz --delete-after \
+        /path/to/ascend-workspaces/ws1/triton-ascend/ \
+        npu-user@a5-primary.example.org:/home/npu-user/permanent_pipeline/triton_ascend/
+    rsync -aHz --delete-after \
+        /path/to/ascend-workspaces/ws1/FlagGems_Ascend/ \
+        npu-user@a5-primary.example.org:/home/npu-user/permanent_pipeline/triton_ascend/test/flaggems_cases/repo/
+
+When a new CANN drops on the host (e.g. 9.2.0 in /data/pri/Ascend/):
+    Update setenv.bash to point to the new version. No image rebuild needed.
+
+When the host kernel/driver upgrades and breaks ABI:
+    Rare. Inspect a fresh CI container's libs (PRE-FLIGHT CHECKLIST), update
+    the Dockerfile's base if needed, rebuild.
+
+DOCKER BUILD GOTCHAS (encountered while building)
+-------------------------------------------------
+
+- `A5 primary` cannot pull from docker.io. Build images on WSL, transfer with
+  `docker save | scp | docker load`.
+- WSL's Docker daemon may not pick up the configured proxy automatically (no
+  systemd in WSL). For pulling base images, use cloud-images.ubuntu.com
+  (works through proxy as a plain wget) and `docker import` instead of pull.
+- deadsnakes PPA no longer ships python3.11 for focal (20.04). Build Python
+  from source — pre-download `Python-3.11.13.tgz` into build context.
+- NNAL (`Ascend-cann-nnal_*.run`) requires `ASCEND_TOOLKIT_HOME` to be set
+  before install. Not relevant if you bind-mount CANN instead of installing.
+- Build through the configured proxy: pass `--build-arg HTTP_PROXY=$http_proxy
+  --build-arg HTTPS_PROXY=$https_proxy --build-arg NO_PROXY=$no_proxy`.
+  Final image strips proxy envs so the runtime is portable.
+
+KEY DETAILS / GOTCHAS (runtime)
+-------------------------------
+
+- Container needs `--privileged` for NPU device access.
+- Host driver is bind-mounted read-only at /usr/local/Ascend/driver. Driver
+  must match host kernel — never put driver in the image.
+- /etc/ascend_install.info is bind-mounted (ro) — CANN init scripts read this
+  for driver-install metadata.
+- /home/npu-user is bind-mounted as the pipeline lives here.
+- /data/pri/Ascend is bind-mounted ro — that's where CANN comes from.
+- /data/whls is bind-mounted ro — wheel cache.
+- BISHENG_INSTALL_PATH defaults UNSET (CANN's set_env.sh handles it). To
+  pin a specific bisheng (matching CI), drop a bisheng .run install at
+  ${PIPELINE_DIR}/bisheng_pkg/ and setenv.bash picks it up.
+- TRITON_ENABLE_TASKQUEUE: defaults to 1. Some tests (notably torch.sort/
+  quantile_dim users) require =1 to avoid a driver-layer race; flip per-test
+  if needed.
+- FlagGems package: `pip install .` of FlagGems fails offline (scikit-build-
+  core wants online deps). Workaround: setenv.bash adds <repo>/src to
+  PYTHONPATH; tests import flag_gems directly.
+- `npu-smi info` may print "can not use command: npu-smi info" — that's the
+  binary's permission check failing under non-root or driver-mismatch; the
+  FlagGems tests still exercise the NPU correctly via the runtime libraries.
+
+VERIFIED ON A5 primary (2026-04-28)
+-----------------------------
+
+Image: ascend_test_env:v2 (1.68 GB) — built on Ubuntu 22.04, NO embedded CANN.
+Container: ascend_test_env (running with --restart=always)
+
+Runtime stack:
+  - Ubuntu 22.04, glibc 2.35, GLIBCXX 3.4.30 (matches CI exactly)
+  - Python 3.11.13
+  - torch 2.7.1+cpu, torch_npu 2.7.1.post4.dev20260428
+  - triton 3.2.0 (via triton_ascend 3.5.1.dev2026042812)
+  - CANN 9.1.0.B010 — bind-mounted from host /data/pri/Ascend/9.1.0.B010
+  - bishengir-compile / hivmc-a5: CANN-bundled at
+      /data/pri/Ascend/9.1.0.B010/cann-9.1.0/tools/bishengir/bin/
+  - bisheng (CCEC): CANN-bundled at /data/pri/Ascend/9.1.0.B010/cann-9.1.0/bin/
+
+Sampled tests (all passed):
+  test_binary_pointwise_ops.py::test_accuracy_add_[dtype0-0.001-shape0]   ✓
+  test_binary_pointwise_ops.py::test_accuracy_mul_[dtype0-shape0]         ✓
+  test_unary_pointwise_ops.py::test_accuracy_abs[dtype0-shape0]           ✓
+  test_unary_pointwise_ops.py::test_accuracy_neg[dtype0-shape0]           ✓
+  test_general_reduction_ops.py::test_accuracy_max_without_dim[dtype0-shape0] ✓
+
+ENVIRONMENT VERIFIED. Matches CI's stack (Ubuntu 22.04, glibc 2.35, CANN 9.1.0).
+
+===============================================================================
+A5 secondary (CANN 9.1.0, NPU_A5, CI server, x86_64)
+===============================================================================
+
+Address: npu-user@a5-secondary.example.org
+
+PRE-FLIGHT (verified 2026-04-29)
+--------------------------------
+
+  - OS:        Ubuntu 20.04.6 (host); CI containers run Ubuntu 22.04 (jammy)
+  - glibc:     2.35 inside CI container (matches A5 primary)
+  - GLIBCXX:   up to 3.4.30 inside CI container
+  - Python:    3.11.13 (custom install at /usr/local/python3.11.13/)
+  - CANN:      9.1.0.B010 at /data/pri/Ascend/9.1.0.B010/ (latest symlink)
+  - Chip:      NPU_A5 / Atlas 350 (same as A5 primary, Ascend950PR_957c target)
+  - NPU dev:   /dev/davinci0..6 (5+ NPU devices)
+  - Docker:    26.1.3 (works fine; A5 primary runs 28.x)
+  - CI image:  triton_op_pipeline:v1.0 (same as A5 primary)
+  - Network:   No external (gitcode, OBS unreachable). Same as .152.
+  - Existing wheel cache at /data/ci_env/ (older versions than A5 primary's
+    /data/whls — we override with A5 primary's newer wheels).
+
+A5 secondary is functionally identical to A5 primary for our purposes — same CI image,
+same host CANN, same chip family. The same `ascend_test_env:v2` image works
+directly without rebuild.
+
+ONE-TIME SETUP — short version (mirrors A5 primary's flow)
+----------------------------------------------------
+
+From WSL with the A5 primary build artifacts already in hand:
+
+    # 1) Reuse the A5 primary v2 image
+    scp /tmp/ascend_test_env_v2.tar npu-user@a5-secondary.example.org:/home/npu-user/
+
+    # 2) Mirror /data/whls from A5 primary to A5 secondary (it doesn't exist on A5 secondary by default):
+    ssh npu-user@a5-primary.example.org "tar cf - -C /data whls" | \
+        ssh npu-user@a5-secondary.example.org "cd /home/npu-user && tar xf -"
+
+    # 3) On A5 secondary: load image, prep dirs, deploy scripts (same files as A5 primary)
+    ssh npu-user@a5-secondary.example.org "
+      docker load -i /home/npu-user/ascend_test_env_v2.tar
+      rm /home/npu-user/ascend_test_env_v2.tar
+      mkdir -p /home/npu-user/permanent_pipeline/{docker,scripts,wheels,fix_bin,system_bin,gen_ir}
+    "
+    scp <REPO_ROOT>/permanent_pipeline_docker/docker/*  npu-user@a5-secondary.example.org:/home/npu-user/permanent_pipeline/docker/
+    scp <REPO_ROOT>/permanent_pipeline_docker/scripts/* npu-user@a5-secondary.example.org:/home/npu-user/permanent_pipeline/scripts/
+
+    # 4) Rsync triton-ascend + FlagGems (gitcode unreachable from A5 secondary):
+    rsync -aHz <REPO_ROOT>/triton-ascend/ \
+        npu-user@a5-secondary.example.org:/home/npu-user/permanent_pipeline/triton_ascend/
+    rsync -aHz <REPO_ROOT>/FlagGems_Ascend/ \
+        npu-user@a5-secondary.example.org:/home/npu-user/permanent_pipeline/triton_ascend/test/flaggems_cases/repo/
+
+    # 5) Wheels: pull NEWER triton_ascend + torch_npu from A5 primary's /data/ci_env.
+    #    A5 secondary's own /data/ci_env has OLDER versions that fail to compile their
+    #    npu_utils.cpp against CANN 9.1.0 headers (RT_LIMIT_TYPE_WARP_STACK_SIZE
+    #    is missing in newer CANN). Don't use A5 secondary's local versions:
+    ssh npu-user@a5-primary.example.org \
+        "tar cf - -C /data/ci_env triton_ascend-3.5.1.dev2026042912-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl torch_npu-2.7.1.post4.dev20260428-cp311-cp311-manylinux_2_28_x86_64.whl" \
+        | ssh npu-user@a5-secondary.example.org "cd /home/npu-user/permanent_pipeline/wheels && tar xf -"
+
+    # 6) Start container, install pip deps, populate builds/system_bin from CANN:
+    ssh npu-user@a5-secondary.example.org "
+      bash /home/npu-user/permanent_pipeline/docker/run.sh
+      docker exec ascend_test_env bash -lc '
+        WHLS=/home/npu-user/whls
+        python3.11 -m pip install --no-index --find-links=\$WHLS \
+            \$WHLS/torch-2.7.1+cpu-*.whl \$WHLS/pybind11-*.whl \
+            pytest==8.3.2 pytest-xdist==3.6.1 psutil==6.0.0 numpy==1.26.4 scipy==1.13.1 \
+            pyyaml einops decorator attrs mpmath sympy pandas python-dateutil six \
+            packaging pluggy iniconfig typing_extensions filelock fsspec jinja2 markupsafe networkx
+      '
+      mkdir -p /home/npu-user/permanent_pipeline/builds/{system_bin,dev_reference,fix}
+      CANN_BIN=/data/pri/Ascend/9.1.0.B010/cann-9.1.0/tools/bishengir/bin
+      for f in \$CANN_BIN/*; do ln -sf \$f /home/npu-user/permanent_pipeline/builds/system_bin/\$(basename \$f); done
+      bash /home/npu-user/permanent_pipeline/scripts/switch_compiler.sh system_bin
+    "
+
+VERIFIED ON A5 secondary (2026-04-29)
+----------------------------
+
+Image: ascend_test_env:v2 (same 1.68 GB image as A5 primary)
+Container: ascend_test_env (--restart=always)
+Stack: identical to A5 primary (Ubuntu 22.04, glibc 2.35, Python 3.11.13,
+       CANN 9.1.0.B010 from host bind-mount).
+Active preset: system_bin → CANN-bundled bishengir-compile / hivmc-a5 /
+       bisheng (all from /data/pri/Ascend/9.1.0.B010/cann-9.1.0/...).
+
+Sampled tests (5/5 passed):
+  test_binary_pointwise_ops.py::test_accuracy_add_[dtype0-0.001-shape0]      ✓
+  test_binary_pointwise_ops.py::test_accuracy_mul_[dtype0-shape0]            ✓
+  test_unary_pointwise_ops.py::test_accuracy_abs[dtype0-shape0]              ✓
+  test_unary_pointwise_ops.py::test_accuracy_neg[dtype0-shape0]              ✓
+  test_general_reduction_ops.py::test_accuracy_max_without_dim[dtype0-shape0] ✓
+
+GOTCHAS specific to A5 secondary
+-----------------------
+
+- A5 secondary's local /data/ci_env wheels are OLDER and incompatible with CANN
+  9.1.0 (npu_utils.cpp header mismatch). Always pull newer wheels from
+  A5 primary's /data/ci_env (procedure above does this).
+- /data/whls doesn't exist on A5 secondary — must be transferred from .152.
+- 5 NPU devices vs A5 primary's 4. We still pin ASCEND_RT_VISIBLE_DEVICES=0 for
+  parity. Adjust if those devices are in use by CI.
+- Identical Docker image, setenv.bash, switch_compiler.sh as .152. Only
+  difference is the bootstrap sources (wheels, /data/whls).
+
+===============================================================================
+Conda NPU host (CANN 8.5, Ascend910_9589, x86_64)
+===============================================================================
+
+Address: npu-user@conda-npu.example.org
+
+PRE-FLIGHT (verified 2026-04-29)
+--------------------------------
+
+Host environment differs significantly from A5 primary — DO NOT reuse the A5 primary image:
+
+  - OS:        Ubuntu 20.04.5 LTS (host AND no Docker installed)
+  - glibc:     2.31, GLIBCXX max 3.4.28
+  - Python:    Available via miniconda envs (existing_npu_env at 3.11.14)
+  - CANN:      8.5.0 at /home/pkg/CANN-1223/Ascend/8.5.0/ (NOT /usr/local/Ascend!)
+  - Chip:      Ascend910_9589 (different family from A5 primary's NPU_A5)
+  - NPU dev:   /dev/davinci0 only (single-NPU host)
+  - Network:   No external (gitcode, OBS unreachable). Same as .152.
+  - Existing wheels: /home/npu-user/ascend-files/ has torch, torch_npu,
+                     triton-ascend cp311 wheels. /home/npu-user/b84411271/ too.
+
+Big difference from A5 primary: NO DOCKER. The "permanent test environment" is a
+conda env (cloned from existing_npu_env) at /home/npu-user/miniconda3/envs/permanent_test_env.
+
+ONE-TIME SETUP
+--------------
+
+Step 1 — Create permanent conda env:
+
+    ssh npu-user@conda-npu.example.org
+    conda create --clone existing_npu_env -n permanent_test_env -y
+    # ~3.4 GB. Ships with: torch 2.7.1+cpu, torch_npu 2.7.1.post3, triton-ascend
+    # 3.4.0.dev2026011116, flag_gems 2.2.
+
+    If existing_npu_env is gone, bootstrap from /home/npu-user/ascend-files/ wheels:
+
+        conda create -n permanent_test_env python=3.11 -y
+        conda activate permanent_test_env
+        pip install --no-deps /home/npu-user/ascend-files/torch-2.7.1+cpu-*.whl
+        pip install --no-deps /home/npu-user/ascend-files/torch_npu-*.whl
+        pip install --no-deps /home/npu-user/ascend-files/triton_ascend-*.whl
+        pip install numpy==1.26.4 scipy pytest pytest-xdist pyyaml einops decorator attrs psutil mpmath sympy
+        pip install -e /home/npu-user/FlagGems_Ascend --no-deps
+
+Step 2 — Build all binaries on WSL (latest A5/dev branches; do NOT reuse
+        any /home/npu-user/bin_*/ directories — they're outside our env):
+
+    On WSL, ensure both repos are at A5/dev and built (build-dev/ is the
+    branch reference, build-fix/ is fix-branch):
+
+        cd /path/to/ascend-workspaces/ws1/AscendNPU-IR-Dev && git checkout A5/dev
+        cd /path/to/ascend-workspaces/ws1/hivmc && git checkout A5/dev
+        # Build per build-ascend-npu-ir.txt and build-hivmc.txt.
+        # Outputs:
+        #   /path/to/ascend-workspaces/ws1/AscendNPU-IR-Dev/build-dev/bin/bishengir-compile
+        #   /path/to/ascend-workspaces/ws1/hivmc/build-dev/bin/hivmc-a5
+        #   /path/to/ascend-workspaces/ws1/hivmc/build-dev/tools/bishengir/lib/Template/*.bc
+
+    Stage everything for fix_bin/ in a temp dir:
+
+        STAGE=/path/to/ascend-workspaces/ws1/permanent_pipeline_conda/fix_bin_staging
+        mkdir -p $STAGE
+        cp /path/to/ascend-workspaces/ws1/AscendNPU-IR-Dev/build-dev/bin/bishengir-compile $STAGE/
+        cp /path/to/ascend-workspaces/ws1/hivmc/build-dev/bin/hivmc-a5 $STAGE/
+        cp /path/to/ascend-workspaces/ws1/hivmc/build-dev/tools/bishengir/lib/Template/host.bc $STAGE/
+        cp /path/to/ascend-workspaces/ws1/hivmc/build-dev/tools/bishengir/lib/Template/regbaseM300.bc $STAGE/
+        # meta_op .bc — RENAME c220→dav-c220, c310→dav-c310:
+        for f in /path/to/ascend-workspaces/ws1/hivmc/build-dev/tools/bishengir/lib/Template/meta_op*.bc; do
+            base=$(basename "$f")
+            newname=$(echo "$base" | sed -E 's/\.(c[0-9]+)\./.dav-\1./')
+            cp "$f" "$STAGE/$newname"
+        done
+        # bisheng + lld + llvm-* — from standalone bisheng_compiler 9.0.0
+        # (CANN 8.5's bundled bisheng is too old for newer hivmc flags):
+        cp /path/to/ascend-workspaces/ws1/bisheng_compiler/bisheng_compiler/bin/{bisheng,cce-ld,lld,llvm-ar,llvm-link} $STAGE/
+
+    Plus: libdevice.10.bc (NOT in any of our repos — copy from A5 primary container,
+    triton-ascend wheel does not ship it):
+
+        ssh npu-user@a5-primary.example.org \
+            "docker cp ascend_test_env:/usr/local/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc /tmp/libdevice.10.bc"
+        scp npu-user@a5-primary.example.org:/tmp/libdevice.10.bc $STAGE/
+
+    Deploy to Conda NPU host:
+
+        ssh npu-user@conda-npu.example.org \
+            "mkdir -p /home/npu-user/permanent_pipeline/{scripts,fix_bin,system_bin,gen_ir}"
+        scp $STAGE/* npu-user@conda-npu.example.org:/home/npu-user/permanent_pipeline/fix_bin/
+
+        # libdevice.10.bc must ALSO live inside the conda env's triton-ascend
+        # backend lib dir (not just fix_bin):
+        ssh npu-user@conda-npu.example.org 'cp \
+            /home/npu-user/permanent_pipeline/fix_bin/libdevice.10.bc \
+            /home/npu-user/miniconda3/envs/permanent_test_env/lib/python3.11/site-packages/triton/backends/ascend/lib/'
+
+        scp /path/to/ascend-workspaces/ws1/permanent_pipeline_conda/scripts/* \
+            npu-user@conda-npu.example.org:/home/npu-user/permanent_pipeline/scripts/
+        ssh npu-user@conda-npu.example.org \
+            "chmod +x /home/npu-user/permanent_pipeline/scripts/*.sh"
+
+Step 3 — Verify env (smoke test):
+
+    bash /home/npu-user/permanent_pipeline/scripts/smoke_test.sh
+
+    Expected output ends with "Smoke test passed" and shows:
+      Python 3.11.14, torch 2.7.1+cpu, torch_npu 2.7.1.post3, triton 3.2.0,
+      npu_available=True, npu_count=1, torch_npu abs: OK.
+
+Step 4 — Run a FlagGems test:
+
+    Use the user's `op_test_run.sh` driver (pytest-marker-based):
+
+        bash -l
+        source /home/npu-user/permanent_pipeline/scripts/setenv.bash
+        cd /home/npu-user/FlagGems_Ascend
+        bash op_test_run.sh tests "abs"
+
+    Or single test:
+
+        pytest -m abs --ref cpu
+
+SIMT vs SIMD PATH SWITCH (Conda NPU host specific)
+----------------------------------------
+
+The path is controlled by NPUOptions.compile_mode in
+$CONDA_PREFIX/lib/python3.11/site-packages/triton/backends/ascend/compiler.py:
+
+    compile_mode: str = "simd"   # default; routes through HIVM path
+                                 #   (bishengir-compile --enable-hivm-compile=true)
+    compile_mode = "unstructured_in_simt"  # sets force_simt_template=True
+    compile_mode = "simt_only"   # routes through SIMT/DPX path
+                                 #   (bishengir-compile --pure-simt)
+
+Underlying field defaults:
+    parallel_mode: str = "simd"
+    force_simt_only: bool = False
+    force_simt_template: bool = False
+
+To exercise both paths:
+  - Default behavior is SIMD (HIVM path) on the current existing_npu_env install.
+  - To switch a single test to SIMT, override NPUOptions when building. Either
+    pass through the test framework's options dict, or temporarily edit the
+    default in compiler.py:
+        sed -i 's/compile_mode: str = "simd"/compile_mode: str = "simt_only"/' \
+          $CONDA_PREFIX/lib/python3.11/site-packages/triton/backends/ascend/compiler.py
+    Then clear cache and re-run:
+        rm -rf ~/.triton/cache/*
+
+Note: many tests on Conda NPU host currently use SIMT/DPX (force_simt_only=True per
+session memory) but the source default is SIMD. Verify which path each test
+suite expects before declaring "both paths work".
+
+VERIFIED ON Conda NPU host (2026-04-29)
+-----------------------------
+
+Env: conda env permanent_test_env (3.4 GB clone of existing_npu_env at
+/home/npu-user/miniconda3/envs/permanent_test_env). Python 3.11.14, torch
+2.7.1+cpu, torch_npu 2.7.1.post3, triton-ascend 3.4.0.dev2026011116, FlagGems
+2.2 editable from /home/npu-user/FlagGems_Ascend.
+
+Compiler binaries — ALL FRESHLY BUILT from latest A5/dev branches, deployed
+into /home/npu-user/permanent_pipeline/fix_bin/. NO references to the user's
+existing /home/npu-user/bin_*/ directories.
+
+  bishengir-compile  ← AscendNPU-IR-Dev/build-dev/bin/  (A5/dev, 5debd02)
+  hivmc-a5           ← hivmc/build-dev/bin/             (A5/dev, 9fece77a4)
+  meta_op.{aic,aiv,mix.aic,mix.aiv}.dav-{c220,c310}.bc
+                     ← hivmc/build-dev/tools/bishengir/lib/Template/
+                       (renamed from c220→dav-c220, c310→dav-c310 per
+                       runtime expectation)
+  host.bc, regbaseM300.bc ← hivmc/build-dev/tools/bishengir/lib/Template/
+  bisheng + cce-ld + lld + llvm-ar + llvm-link
+                     ← cann-bisheng-compiler_9.0.0_linux-x86_64.run
+                       (extracted standalone bisheng compiler — newer than
+                       CANN 8.5's bundled bisheng, which doesn't recognize
+                       hivmc's new -cce-vf-aa-between-iters flag)
+  libdevice.10.bc    ← copied from A5 primary's permanent_test_env container
+                       (placed in conda env's
+                       lib/python3.11/site-packages/triton/backends/ascend/lib/)
+
+SIMT path (compile_mode="simt_only") — VERIFIED PASSING:
+  Sampled tests, all passed:
+    test_unary_pointwise_ops.py::test_accuracy_abs[dtype0-shape0]   ✓
+    test_unary_pointwise_ops.py::test_accuracy_neg[dtype0-shape0]   ✓
+    test_binary_pointwise_ops.py::test_accuracy_add_[dtype0-0.001-shape0] ✓
+    test_binary_pointwise_ops.py::test_accuracy_mul_[dtype0-shape0] ✓
+
+SIMD path (compile_mode="simd") — STILL FAILS:
+  Same tests fail with NPU error 507035 (vector core exception). This is
+  consistent with project memory ("All tests use SIMT/DPX path:
+  force_simt_only: bool = True in existing_npu_env's NPUOptions") — Conda NPU host historically
+  only runs the SIMT path correctly. SIMD failure is independent of our
+  binary build (reproduces with bin_rel1, bin_blue2 too).
+
+Default mode pinning:
+  setenv.bash auto-patches compiler.py on first source to set
+    compile_mode: str = "simt_only"
+  Backup of original at compiler.py.bak_default. Switch via:
+    bash /home/npu-user/permanent_pipeline/scripts/switch_mode.sh simd
+    bash /home/npu-user/permanent_pipeline/scripts/switch_mode.sh simt_only
+
+THE KEY DEBUGGING JOURNEY (so this doesn't happen again):
+
+  Symptom: SIMT compilation failed with
+    "cannot be converted to LLVM IR: missing `LLVMTranslationDialectInterface`
+     registration for dialect for op: ascend_dpx.block_idx_x"
+
+  Root causes (cumulative; fix all to get to PASS):
+    1. fix_bin had only `hivmc` symlink, not `hivmc-a5`. bishengir-compile
+       checks BISHENG_INSTALL_PATH for `hivmc-a5` specifically and falls
+       back to inline translation when missing — which doesn't have the
+       DPX dialect interface registered. Fix: deploy `hivmc-a5` (not just
+       `hivmc`) into fix_bin/.
+    2. fix_bin lacked the meta_op.*.dav-{c220,c310}.bc, host.bc,
+       regbaseM300.bc that hivmc-a5 needs at runtime. Fix: copy + rename
+       (c220→dav-c220, c310→dav-c310).
+    3. fix_bin lacked `bisheng` (CCEC). Fix: deploy bisheng from CANN or
+       standalone bisheng_compiler bundle.
+    4. CANN 8.5's bundled bisheng didn't recognize newer hivmc options like
+       `-cce-vf-aa-between-iters=true`. Fix: deploy bisheng from
+       cann-bisheng-compiler_9.0.0 standalone bundle.
+    5. triton-ascend backend lacked libdevice.10.bc at
+       lib/python3.11/site-packages/triton/backends/ascend/lib/.
+       Fix: copy from A5 primary's container.
+    6. compile_mode default was "simd" — change to "simt_only" to actually
+       use the DPX path. Auto-applied by setenv.bash.
+
+  All six pieces were needed — fixing fewer leaves cryptic compile errors.
+
+GOTCHAS (Conda NPU host specific)
+-----------------------
+
+- DO NOT use `set -e` in scripts that source setenv.bash — `conda activate`
+  returns non-zero exit codes in non-interactive shells (despite working).
+  smoke_test.sh deliberately omits set -e.
+- CANN at /home/pkg/CANN-1223/Ascend/8.5.0/, NOT /usr/local/Ascend/8.5.0/
+  (the latter has no setenv.bash).
+- Single NPU device — if 507035 corruption hits, no fallback device.
+- The existing_npu_env chain in user's setenv_triton_ascend.sh activates `triton`
+  conda env first, then memory says they re-activate existing_npu_env. Our
+  permanent_test_env clone matches existing_npu_env exactly so we use it directly.
+- Different chip → different ops package → must use bishengir-compile that
+  was built FOR Ascend910_9589 (bin_blue2 / bin_rel1). The CANN-bundled
+  bishengir-compile in /usr/local/Ascend/8.5.0/ is NOT present (this CANN
+  install only has ccec/bisheng — no bishengir-compile in toolkit).
+
+===============================================================================
+LESSONS LEARNED (read before debugging next setup)
+===============================================================================
+
+1. ALWAYS run the PRE-FLIGHT CHECKLIST before picking a base image. We picked
+   Ubuntu 20.04 because the host is 20.04, then discovered CI runs 22.04
+   inside its container — needed glibc 2.35 / GLIBCXX_3.4.29+. Cost: 4 hours
+   of rebuild time.
+
+2. CANN version != image version. CI containers ship an old CANN inside but
+   bind-mount a newer CANN from the host. Match the bind-mount, not the
+   embedded one.
+
+3. bishengir-compile + hivmc-a5 + bisheng MUST be a matched set. Mixing
+   versions causes bisheng to segfault (exit 139) on IR hivmc-a5 produces.
+   Don't blindly use fix_bin/ binaries unless you've also rebuilt them
+   against the CANN you're using.
+
+4. Always run a CI-known-passing test first to verify the env. A failure on
+   a random test could be a known compiler bug — don't assume that without
+   cross-checking against CI.

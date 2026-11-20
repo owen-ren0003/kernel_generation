@@ -1,0 +1,192 @@
+===============================================================================
+Creating a PR on gitcode.com (e.g. Ascend/AscendNPU-IR-Dev)
+===============================================================================
+
+gitcode uses the Gitee-style REST API at /api/v5/. We can drive the entire
+PR-creation flow from the command line — no web UI needed — using a personal
+access token (PAT). This avoids the two-step "select branch → next" web form
+and lets the harness create PRs programmatically.
+
+Web UI also works; commands below mirror what the form does. PR creation via
+API is preferred for reproducibility and to avoid the 目标分支 selection step
+that's easy to miss.
+
+-------------------------------------------------------------------------------
+0. Template variables
+-------------------------------------------------------------------------------
+
+  <YOUR_GITCODE_USER>      Your gitcode username (the fork owner).
+  <YOUR_GITCODE_PAT>       Personal access token from your local credential store.
+                           Keep it out of committed files.
+  <UPSTREAM_OWNER>         Org owning the upstream repo.
+                           Example: Ascend.
+  <REPO>                   Repo name.
+                           Example: AscendNPU-IR-Dev.
+  <FIX_BRANCH>             Local branch with your commits.
+                           Example: fix/wy-fast-cv-cross-scope-reuse.
+  <TARGET_BRANCH>          Branch on the upstream repo you want to merge into.
+                           Example: A5/dev.
+  <PR_TITLE>               Single-line title. Follow upstream's prefix
+                           convention; for this repo: "[AscendNPU IR] ...".
+  <PR_BODY_FILE>           Path to a file holding the PR description body.
+                           Multi-line; will be JSON-escaped automatically.
+
+-------------------------------------------------------------------------------
+1. Prerequisites
+-------------------------------------------------------------------------------
+
+The PAT must have permissions to create PRs against <UPSTREAM_OWNER>/<REPO>
+on behalf of <YOUR_GITCODE_USER>'s fork. Verify auth before posting:
+
+    PAT="<YOUR_GITCODE_PAT>"
+    curl -s -o /dev/null -w "HTTP=%{http_code}\n" \
+      -H "Authorization: Bearer $PAT" \
+      "https://gitcode.com/api/v5/user"
+
+Expect HTTP=200. (Bearer header and ?access_token=$PAT query param both work
+on /api/v5/; the v4 / v1 / Gitea-style paths do NOT.)
+
+-------------------------------------------------------------------------------
+2. Push your fix branch to your fork
+-------------------------------------------------------------------------------
+
+Per instructions/clone-repositories.txt §d, the workspace convention is:
+
+  origin    = <YOUR_GITCODE_USER>'s fork
+  upstream  = <UPSTREAM_OWNER>'s canonical repo
+
+If the workspace clone instead has origin = upstream (which has happened in
+practice — verify with `git remote -v`), add the fork as a separate remote
+named `fork` rather than renaming, to avoid breaking any harness automation
+that uses `origin`:
+
+    cd <workspace>/<REPO>
+    git remote add fork \
+      "https://gitcode.com/<YOUR_GITCODE_USER>/<REPO>.git"
+
+Push:
+
+    git push -u fork <FIX_BRANCH>
+    # if a force-push is needed (e.g. after rebase):
+    git push --force-with-lease fork <FIX_BRANCH>
+
+-------------------------------------------------------------------------------
+3. Rebase onto current upstream <TARGET_BRANCH>
+-------------------------------------------------------------------------------
+
+gitcode's PR creation refuses if your branch has conflicts with the target.
+Before opening the PR, rebase onto current upstream:
+
+    git fetch origin <TARGET_BRANCH>   # or `upstream <TARGET_BRANCH>` if that
+                                       # remote exists
+
+If your branch was originally based on an unrelated commit chain (e.g. an
+ancestor PR that has since been partially merged), use --onto so only your
+fix commits are replayed:
+
+    git rebase --onto origin/<TARGET_BRANCH> <ORIGINAL_BASE> <FIX_BRANCH>
+
+Resolve any conflicts, then force-push (see §2).
+
+-------------------------------------------------------------------------------
+4. Create the PR via the v5 API
+-------------------------------------------------------------------------------
+
+Build the JSON payload with Python to avoid shell-quoting issues for
+multi-line bodies:
+
+    python3 -c '
+    import json
+    with open("<PR_BODY_FILE>") as f:
+        body = f.read()
+    print(json.dumps({
+        "title": "<PR_TITLE>",
+        "head": "<YOUR_GITCODE_USER>:<FIX_BRANCH>",
+        "base": "<TARGET_BRANCH>",
+        "body": body,
+    }))
+    ' > /tmp/pr-payload.json
+
+POST to /pulls:
+
+    curl -s -o /tmp/pr-create.json -w "HTTP=%{http_code}\n" \
+      -X POST \
+      "https://gitcode.com/api/v5/repos/<UPSTREAM_OWNER>/<REPO>/pulls?access_token=<YOUR_GITCODE_PAT>" \
+      -H "Content-Type: application/json" \
+      --data-binary @/tmp/pr-payload.json
+
+Expect HTTP=200. The response JSON contains:
+  - "iid": the human-facing PR number (e.g. 1200).
+  - "html_url" (if present) or assemble it as:
+      https://gitcode.com/<UPSTREAM_OWNER>/<REPO>/merge_requests/<iid>
+    (the alias /pull/<iid> also works.)
+
+-------------------------------------------------------------------------------
+5. Trigger CI by posting a "compile" comment
+-------------------------------------------------------------------------------
+
+For Ascend repos, posting a comment containing the single word "compile" on
+the PR triggers the BiShengMAX-RegBase-Quick-Pipeline (and the other Quick
+checks).
+
+    PR_IID=<iid from §4>
+    python3 -c 'import json; print(json.dumps({"body": "compile"}))' > /tmp/comment.json
+    curl -s -o /tmp/comment-resp.json -w "HTTP=%{http_code}\n" \
+      -X POST \
+      "https://gitcode.com/api/v5/repos/<UPSTREAM_OWNER>/<REPO>/pulls/${PR_IID}/comments?access_token=<YOUR_GITCODE_PAT>" \
+      -H "Content-Type: application/json" \
+      --data-binary @/tmp/comment.json
+
+(Other repos may use a different trigger word — `/test`, `/ci`, `/retest`.
+Confirm with the repo's maintainers if unsure. For this repo: "compile".)
+
+-------------------------------------------------------------------------------
+6. Useful follow-up API calls
+-------------------------------------------------------------------------------
+
+Get a PR's current state (title, body, mergeable, head_sha, etc.):
+
+    curl -s "https://gitcode.com/api/v5/repos/<UPSTREAM_OWNER>/<REPO>/pulls/<iid>?access_token=<YOUR_GITCODE_PAT>"
+
+Update the PR body (e.g. after CI feedback):
+
+    python3 -c '
+    import json
+    with open("<NEW_BODY_FILE>") as f: body = f.read()
+    print(json.dumps({"body": body}))
+    ' > /tmp/pr-update.json
+    curl -s -X PATCH \
+      "https://gitcode.com/api/v5/repos/<UPSTREAM_OWNER>/<REPO>/pulls/<iid>?access_token=<YOUR_GITCODE_PAT>" \
+      -H "Content-Type: application/json" \
+      --data-binary @/tmp/pr-update.json
+
+List PRs on a repo (e.g. to find a previously-opened one before reopening):
+
+    curl -s "https://gitcode.com/api/v5/repos/<UPSTREAM_OWNER>/<REPO>/pulls?state=open&access_token=<YOUR_GITCODE_PAT>"
+
+-------------------------------------------------------------------------------
+7. Notes on what did NOT work
+-------------------------------------------------------------------------------
+
+- /api/v4/*  (GitLab style)   — returns NOT_PATH 404.
+- /api/v1/repos/*/pulls (Gitea style) — returns NOT_PATH 404.
+- `PRIVATE-TOKEN: $PAT` header (GitLab convention) — 401 token not found.
+
+Use only /api/v5/ with either ?access_token=PAT or
+"Authorization: Bearer $PAT".
+
+-------------------------------------------------------------------------------
+8. Sanity-check checklist before posting
+-------------------------------------------------------------------------------
+
+  [ ] Branch is rebased onto current upstream <TARGET_BRANCH>; no conflicts.
+  [ ] Branch contains ONLY your fix commits (not also commits from a parent
+      PR that's still pending separately — use `git log --oneline
+      upstream/<TARGET_BRANCH>..<FIX_BRANCH>` to confirm).
+  [ ] Commit messages are title-only when the long description belongs in
+      the PR body (this repo's convention as of 2026-05-21).
+  [ ] No Co-Authored-By tags or other agent signatures in the commit
+      messages (this repo's convention).
+  [ ] PR body file does NOT lead with a line that duplicates the PR title.
+  [ ] Reviewer-related harness gates (reward-hack-reviewer verdict, etc.)
+      have already approved the diff_sha being shipped.

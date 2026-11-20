@@ -1,0 +1,29 @@
+mode: "{{MODE}}"
+id: "{{ID}}"
+created_at: "{{CREATED_AT}}"
+status: "open"
+focus: "{{FOCUS}}"
+
+repo_path: ""
+base_branch: ""
+fix_branch: ""
+artifact_dir: ".local-artifacts/{{TASK_ID}}"
+
+pre_fix_command: ""
+post_fix_command: ""
+regression_command: ""
+
+semantic_success_criterion: ""
+
+# Keep empty unless the user explicitly authorizes an AI-identifying branch
+# name. Each exception must contain `branch` and `user_authorization` strings.
+ai_branch_name_exceptions: []
+
+in_scope_paths:
+  - "{{TASK_DIR}}"
+  - ".local-artifacts/{{TASK_ID}}"
+
+max_tool_calls_per_log_entry: 20
+consultation_failure_threshold: 2
+min_attempts_before_give_up: 3
+prior_attempts: []

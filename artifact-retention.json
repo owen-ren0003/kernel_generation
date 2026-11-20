@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "keep_days": 7,
+  "minimum_hours": 24,
+  "task_budget_gib": 5,
+  "total_budget_gib": 20,
+  "sweep_hours": 6
+}

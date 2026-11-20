@@ -1,0 +1,9 @@
+id: example-bug
+title: Example bug title
+source: manual
+description: |
+  Describe the bug and why the current behavior is wrong.
+reproducer:
+  command: "false"
+  expected: "Command should fail before the fix."
+  observed: "Exit status 1."

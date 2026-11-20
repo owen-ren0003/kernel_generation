@@ -1,0 +1,74 @@
+===============================================================================
+Extracting the Bisheng Compiler (ccec/bisheng executables)
+===============================================================================
+
+The bisheng compiler is a proprietary binary that we cannot build ourselves.
+It is used by hivmc and bishengir-compile for final code generation.
+
+=== Where to find bisheng ===
+
+1. From CI containers on A5 primary / A5 secondary:
+   CONTAINER=$(docker ps --format '{{.Names}}' | grep triton_CI_op | head -1)
+   WORKSPACE=$(docker exec $CONTAINER ls /data/autotest/optest_fast_pipeline/ | tail -1)
+   BISHENG_DIR=/data/autotest/optest_fast_pipeline/$WORKSPACE/test/bisheng/tools/bishengir/bin/bisheng
+   docker exec $CONTAINER ls $BISHENG_DIR/
+
+2. From the host CANN install on A5 primary / A5 secondary (CANN 9.1.0.B010, recommended):
+   /data/pri/Ascend/9.1.0.B010/cann-9.1.0/tools/bisheng_compiler/bin/bisheng
+   /data/pri/Ascend/9.1.0.B010/cann-9.1.0/x86_64-linux/ccec_compiler/bin/bisheng
+   (same binary, two paths — md5 d081ad58…)
+
+3. From the installed triton package (inside legacy CI containers):
+   /usr/local/python3.11.13/lib/python3.11/site-packages/triton/backends/ascend/bishengir/bin/bisheng/
+
+4. From the standalone bisheng-compiler .run:
+   cann-bisheng-compiler_9.0.0_linux-x86_64.run  (used on Conda NPU host because CANN
+   8.5's bundled bisheng is too old for newer hivmc flags). Already extracted
+   on the WSL build host at <REPO_ROOT>/bisheng_compiler/bisheng_compiler/bin/.
+
+5. From the permanent test env on Conda NPU host:
+   /home/npu-user/permanent_pipeline/builds/dev_reference/bisheng (or other
+   preset). See permanent-test-env.txt for layout. NOTE: the older
+   /home/npu-user/bin_bak/, bin_bak2/, bin_blue*/ dirs on Conda NPU host are
+   OUTDATED and should be deleted — they predate the permanent test env.
+
+=== What bisheng contains ===
+
+The bisheng directory contains:
+  - ccec         (the main CCE compiler, compiles LLVM IR to Ascend binary)
+  - llvm-link    (links bitcode modules)
+  - possibly other tools
+
+=== Setting BISHENG_INSTALL_PATH ===
+
+BISHENG_INSTALL_PATH must point to the PARENT directory containing the bisheng/
+subdirectory. For example:
+
+  If bisheng executables are at: /path/to/bin/bisheng/ccec
+  Then set: export BISHENG_INSTALL_PATH=/path/to/bin
+
+bishengir-compile looks for: $BISHENG_INSTALL_PATH/bisheng/ccec
+hivmc-a5 looks for:          $BISHENG_INSTALL_PATH/bisheng/ccec
+
+=== Copying bisheng to local machine ===
+
+  # From a CI container on A5 primary:
+  CONTAINER=triton_CI_op_XXXXX
+  BISHENG_DIR=<path found above>
+  docker exec $CONTAINER tar cf - -C $(dirname $BISHENG_DIR) bisheng | \
+    tar xf - -C ~/dt_debug/system_bin/
+
+  # From the host CANN install on A5 primary / A5 secondary (recommended):
+  scp npu-user@a5-primary.example.org:/data/pri/Ascend/9.1.0.B010/cann-9.1.0/tools/bisheng_compiler/bin/bisheng ./
+
+  # From Conda NPU host's permanent test env (after it's set up — see permanent-test-env.txt):
+  scp npu-user@conda-npu.example.org:/home/npu-user/permanent_pipeline/builds/dev_reference/bisheng ./
+
+  # The older bin_bak/, bin_bak2/, bin_blue*/ dirs on Conda NPU host should be deleted
+  # — they predate the permanent test env and are no longer the source of truth.
+
+=== Important ===
+
+  - bisheng binaries are architecture-specific (x86_64 for our build hosts)
+  - The bisheng version must match the CANN version on the target device
+  - Conda NPU host has CANN 8.5, A5 primary/A5 secondary have CANN 9.0 — use matching bisheng

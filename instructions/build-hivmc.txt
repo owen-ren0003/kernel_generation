@@ -1,0 +1,84 @@
+===============================================================================
+Building hivmc
+===============================================================================
+
+Prerequisites:
+  - Docker environment (see docker-setup.txt)
+  - Bisheng compiler extracted (see extract-bisheng-compiler.txt)
+  - Huawei LLVM fork cloned into hivmc/third-party/llvm-project/ (NOT symlinked)
+
+Source: <REPO_ROOT>/hivmc/
+
+  <REPO_ROOT> is the parent directory containing AscendNPU-IR-Dev/ and hivmc/.
+  Any host path is fine; the Docker container's `-v` mount maps it to /src/
+  inside the container (see docker-setup.txt). All in-doc paths use
+  /src/hivmc/ for the in-container view.
+
+=== Branch Convention ===
+
+  hivmc development branch: A5/dev (NOT master)
+  master: Old development branch, may return to it later.
+  Note: hivmc and AscendNPU-IR-Dev both use A5/dev currently, but this may
+  diverge in the future. Always check the correct dev branch for each repo.
+
+=== Build Directories ===
+
+  build-dev/         Release build of A5/dev branch (reference)
+  build-fix/         Release build with our fixes applied
+  build-dev-debug/   Debug build of A5/dev branch
+  build-fix-debug/   Debug build with our fixes applied
+
+=== LLVM Fork Setup (first time) ===
+
+  The hivmc build requires Huawei's LLVM fork (different from AscendNPU-IR-Dev's).
+  It must be cloned directly into hivmc/third-party/llvm-project/ (NOT symlinked).
+
+  cd /src/hivmc/third-party
+  rm -rf llvm-project
+  git clone <huawei-llvm-fork-url> llvm-project
+
+=== Environment Notes ===
+
+  No conda environment needed inside Docker. Same PATH setup as AscendNPU-IR-Dev:
+    export PATH=/usr/local/bin:/usr/lib/llvm-17/bin:$PATH
+
+=== Setting BISHENG_INSTALL_PATH ===
+
+  # Point to directory containing bisheng/ subdirectory
+  export BISHENG_INSTALL_PATH=/src/bisheng_compiler/bisheng_compiler/bin
+  # Or wherever you extracted bisheng (see extract-bisheng-compiler.txt)
+
+=== Clean Build (Release) ===
+
+  docker exec -w /src/hivmc ascend-build bash -c "
+    export PATH=/usr/local/bin:/usr/lib/llvm-17/bin:\$PATH
+    export BISHENG_INSTALL_PATH=/src/bisheng_compiler/bisheng_compiler/bin
+    ./build-tools/build.sh --c-compiler clang-17 --cxx-compiler clang++-17 \
+      '--add-cmake-options=-DLLVM_ENABLE_LLD=ON' --build-type Release \
+      --enable-assertion --disable-werror --build-triton \
+      -t --bisheng-compiler \${BISHENG_INSTALL_PATH} -o ./<BUILD_DIR>"
+
+  Replace <BUILD_DIR> with: build-dev, build-fix, etc.
+  For Debug: change --build-type Release to --build-type Debug.
+
+=== Output ===
+
+  Binary:   /src/hivmc/<BUILD_DIR>/bin/hivmc-a5  (NOT "hivmc")
+  .bc files: /src/hivmc/<BUILD_DIR>/tools/bishengir/lib/Template/meta_op.*.bc
+
+=== Important: .bc file renaming ===
+
+  hivmc build produces: meta_op.aiv.c310.bc
+  Runtime expects:      meta_op.aiv.dav-c310.bc
+
+  Must rename with "dav-" prefix when deploying:
+    for f in meta_op.*.bc; do
+      mv "$f" "$(echo $f | sed 's/\.\(c[0-9]*\)\./\.dav-\1\./')"
+    done
+
+=== Important Notes ===
+
+  - hivmc binary is named "hivmc-a5" (not "hivmc")
+  - bishengir-compile hardcodes this name when calling hivmc externally
+  - The build script is build-tools/build.sh (NOT bishengir/build.sh)
+  - Release build produces ~150MB binary; Debug produces ~1.5GB

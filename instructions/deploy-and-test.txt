@@ -1,0 +1,402 @@
+===============================================================================
+Deploy and Test on A5 primary, A5 secondary, Conda NPU host
+===============================================================================
+
+This file is the canonical reference for the build/deploy/test pipeline.
+Read it before invoking any build or deploy script. The conventions here
+are enforced by harness scripts and hooks.
+
+For long-lived test environments that survive CI churn, see
+permanent-test-env.txt — describes the per-machine envs at
+/home/npu-user/permanent_pipeline/.
+
+
+===============================================================================
+QUICK START PER MACHINE (canonical recipes — start here)
+===============================================================================
+
+--- Conda NPU host (conda, single NPU, SIMT-only path) ---
+
+  # Build (in WSL):
+  bash scripts/build-ascend-npu-ir.sh --workspace ws1 --build-type rel \
+       --descriptor my-fix
+
+  # Deploy + activate (binary + bitcode + symlink in one step):
+  bash scripts/deploy-binary.sh --target Conda NPU host --workspace ws1 \
+       --preset bin-rel-my-fix --activate
+
+  # Run one test:
+  ssh npu-user@conda-npu.example.org 'bash -lc "
+    source /home/npu-user/permanent_pipeline/scripts/setenv.bash
+    cd /home/npu-user/FlagGems_Ascend
+    pytest tests/test_general_reduction_ops.py::test_accuracy_sum -sv --ref cpu
+  "'
+
+  After every preset switch:  rm -rf ~/.triton/cache/*
+
+--- A5 primary / A5 secondary (docker, multi-NPU, SIMD + SIMT paths) ---
+
+  # Build (in WSL):
+  bash scripts/build-ascend-npu-ir.sh --workspace ws1 --build-type rel \
+       --descriptor my-fix
+
+  # Deploy + activate to the workspace's slot:
+  bash scripts/deploy-binary.sh --target A5 primary --workspace ws1 \
+       --preset bin-rel-my-fix --activate
+
+  # Run one test (uses the container chosen by the harness):
+  bash scripts/run-tests.sh --target A5 primary --workspace ws1 --test \
+       "tests/test_general_reduction_ops.py::test_accuracy_sum"
+
+  After every preset switch:  cache clear is included in run-tests.sh.
+
+
+===============================================================================
+NAMING CONVENTION (mandatory)
+===============================================================================
+
+All build folders and bin folders follow the same descriptor pattern:
+
+  Build folders (in a workspace's source repo, e.g.
+                 ~/work/ws1/AscendNPU-IR-Dev/):
+    build-<rel|debug>-<descriptor>
+
+  Bin folders (on test machine, under permanent_pipeline/builds/):
+    bin-<rel|debug>-<descriptor>     for built binaries
+    bin-system-<descriptor>          for stock/ticket-pinned binaries
+                                     (descriptor = ticket id or pipeline name)
+
+  Active symlink directory (on test machine):
+    bin-active/                      symlinks point into builds/<preset>/
+                                     setenv.bash puts this first on PATH
+
+Examples:
+    ~/work/ws1/AscendNPU-IR-Dev/build-rel-dev/
+    ~/work/ws1/AscendNPU-IR-Dev/build-debug-fix-cv-pipeline-kkt/
+    ~/work/ws1/hivmc/build-rel-fix-half2-setcc/
+    ~/permanent_pipeline/builds/bin-rel-dev/
+    ~/permanent_pipeline/builds/bin-debug-fix-cv-pipeline-kkt/
+    ~/permanent_pipeline/builds/bin-system-reference/
+    ~/permanent_pipeline/bin-active/   (active preset's symlink farm)
+
+Build folder name and its deployed bin folder name MATCH on the
+descriptor — only the prefix family differs. A build folder
+`build-rel-fix-cv-pipeline-kkt` deploys to `bin-rel-fix-cv-pipeline-kkt`.
+
+Lazy creation policy:
+  - Build/bin folders are created ON DEMAND. If a debug task only needs
+    one build (e.g. baseline A5/dev), there is exactly one build folder
+    and one bin folder. Do not pre-provision the full set.
+  - Existing build/bin folders are NEVER auto-deleted by harness scripts.
+    They may be load-bearing for parallel sessions or archived
+    experiments. Cleanup requires explicit user instruction.
+
+Build tracker (see "Build Tracker" section below) records what each
+folder contains so the harness can answer "do I already have a build
+for commit X?" without rebuilding.
+
+
+===============================================================================
+REPRODUCTION POLICY (when handed a DTS ticket / external bug report)
+===============================================================================
+
+Follow these rules in order. Stop at the first one that succeeds.
+
+  1. USE THE ENV PROVIDED IN THE TICKET FIRST.
+     If the ticket names a specific container, workspace path, compiler
+     bin dir, ASCEND_RT_VISIBLE_DEVICES, etc. — run the repro EXACTLY
+     as written. Do not substitute your own binaries or paths. The
+     ticket env is ground truth: if it doesn't reproduce there, our
+     environment can't disprove it.
+
+  2. IF THE TICKET ENV IS GONE, FALL BACK TO THE PERMANENT TEST ENV.
+     CI containers get recycled; named workspaces vanish. If
+     `docker ps` doesn't show the ticket container, OR the workspace
+     path is missing, switch to:
+       A5 primary: container `ascend_test_env` (see permanent-test-env.txt)
+       A5 secondary:  container `ascend_test_env`
+       Conda NPU host: conda env `permanent_test_env`
+     Mirror the ticket env as closely as possible: same CANN version,
+     same compiler bin dir if it's preserved at /data/ci_env/.../.
+
+  3. REPRODUCE WITH THE TICKET'S BINARIES FIRST.
+     The ticket usually points at a specific compiler bin dir, e.g.
+     /data/ci_env/A5_dev/<date>/.... Deploy those into
+     bin-system-<ticket-id>/ on the test machine and activate as the
+     first repro attempt. ONLY if the bug DOES NOT reproduce with
+     these, retry with the latest A5/dev build (bin-rel-dev).
+
+  4. ONLY DEBUG/FIX IF REPRODUCIBLE.
+     If we can reproduce, proceed with investigation + fix.
+     If we cannot reproduce on the ticket env or the permanent env,
+     try other reasonable envs in this order:
+       a. Other live triton_CI_op_* container on A5 primary with matching
+          CI workspace.
+       b. A5 secondary if it has matching CANN/branch.
+       c. Conda NPU host (note: different chip, not all bugs reproduce here).
+     If NONE reproduce the bug: STOP. Report "cannot-reproduce" with
+     the env matrix tried. Do not guess at fixes for bugs we haven't
+     seen with our own eyes.
+
+How to record: state/tasks/<task>/issues/<id>/VERDICT.md must contain
+the env matrix tried, not just the final answer.
+
+
+===============================================================================
+BASELINE-FIRST DISCIPLINE (read before patching the compiler)
+===============================================================================
+
+Before applying any candidate patch, prove the baseline behavior:
+
+  1. Build the vanilla SHA (no patches) into a `build-rel-dev` or
+     `build-rel-baseline-<sha>` folder.
+  2. Deploy to `bin-rel-dev` (or matching bin folder), activate, run
+     the reproducer.
+  3. Compare against the daily compiler's behavior on the same input.
+     If the local vanilla baseline doesn't match the daily, STOP —
+     the harness has a build configuration problem, not the change
+     under investigation. Resolve before iterating.
+
+This rule exists because we have lost time iterating on patches
+against a baseline that itself diverged from the daily. The diff
+between "local fix" and "daily" was being attributed to the patch
+when it actually came from the build configuration.
+
+Recommended sequence:
+  1. Build baseline → BUILD_INFO.txt records flags + SHA.
+  2. Deploy baseline → tracker records the deploy.
+  3. Run reproducer with baseline → confirm matches daily.
+  4. THEN apply candidate patch in a separate build folder.
+
+
+===============================================================================
+BUILD TRACKER
+===============================================================================
+
+The harness records every build and deploy in
+`state/build-tracker/<workspace>.yaml`. The tracker answers:
+
+  - "Do I already have a build for commit X?" → grep tracker.
+  - "What's currently in bin-rel-dev on Conda NPU host?" → one yaml lookup.
+  - "Which existing build folder is closest to my target commit?"
+    → `scripts/pick-build-folder.sh` reads the tracker, ranks by
+       `git rev-list --count` distance, recommends reuse vs new
+       folder.
+
+Update is automatic: build-binaries.sh and deploy-binary.sh write the
+tracker as a tail step. Atomic .tmp + mv so concurrent reads never
+see a half-written file.
+
+Schema (per workspace, one file):
+
+  workspace: ws1
+  last_updated: 2026-05-19T14:30:00-07:00
+  builds:
+    AscendNPU-IR-Dev:
+      build-rel-dev:
+        commit: abc1234567
+        branch: A5/dev
+        build_type: release
+        built_at: 2026-05-19T10:00:00-07:00
+    hivmc: { ... }
+  deployments:
+    Conda NPU host:
+      bin-rel-dev:
+        source_commit: abc1234567
+        source_repo: AscendNPU-IR-Dev
+        deployed_at: 2026-05-19T10:15:00-07:00
+      bin-system-reference:
+        source: <ticket-or-baseline>
+        source_commit: <ticket-pinned-sha>
+        deployed_at: 2026-05-08T14:00:00-07:00
+
+
+===============================================================================
+BINARIES TO DEPLOY (the "what files" reference)
+===============================================================================
+
+For Conda NPU host (conda, SIMT-only path) — `bin-rel-*/` MUST contain:
+
+  bishengir-compile          (AscendNPU-IR-Dev A5/dev build)
+  hivmc-a5                   (hivmc A5/dev build — "-a5" suffix
+                              is REQUIRED. bishengir-compile looks
+                              for this exact name; symlinking `hivmc`
+                              is not enough.)
+  bisheng                    (from cann-bisheng-compiler_9.0.0
+                              standalone bundle; CANN 8.5's bundled
+                              bisheng is too old)
+  cce-ld lld llvm-ar llvm-link
+                             (same standalone bundle)
+
+For Conda NPU host, additionally REQUIRED at $bin/../lib/ (resolved by
+bishengir-compile via `getLibDirFromExecutable`; if `bin-active/` is
+the active bin folder, this is `bin-active/../lib/` =
+`permanent_pipeline/lib/`):
+
+  meta_op.aic.c220.bc          meta_op.aic.c310.bc
+  meta_op.aiv.c220.bc          meta_op.aiv.c310.bc
+  meta_op.mix.aic.c220.bc      meta_op.mix.aic.c310.bc
+  meta_op.mix.aiv.c220.bc      meta_op.mix.aiv.c310.bc
+  host-a5.bc                  (renamed from host.bc per the
+                               AscendNPU-IR-Dev bitcode layout change;
+                               post-commit 98c89f2)
+
+**IMPORTANT — no `dav-` rename anymore.** Older instructions told you
+to rename `meta_op.aiv.c220.bc → meta_op.aiv.dav-c220.bc`. That was
+correct for pre-Apr-2026 builds (which set `AIV_BITCODEAttr` to the
+prefixed name). Post-commit 3fd9344 ("Migrate metaop to bishengir") +
+98c89f2 ("change host.bc to host-a5.bc"), bishengir-compile sets the
+attribute to the un-prefixed name (`meta_op.aiv.c220.bc`). Renaming
+now makes it look as if the bitcode is *missing* and you get
+`[ERROR]cannot find bitcode for coretype 1` at runtime. See memory
+`bitcode_layout_change.md`.
+
+(Note: `regbaseM300.bc` is Ascend310P-only and is NOT produced by
+the current AscendNPU-IR-Dev build. Conda NPU host / Ascend910_9589 tests pass
+without it.)
+
+Plus the conda env's site-packages:
+
+  <env>/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc
+                             (NOT in triton-ascend wheel — must be
+                              copied separately. On the permanent
+                              env, it's already in place; verify with
+                              `ls $CONDA_PREFIX/lib/python3.11/site-packages/triton/backends/ascend/lib/`)
+
+And the compile_mode patch:
+
+  <env>/lib/python3.11/site-packages/triton/backends/ascend/compiler.py
+                             Default `compile_mode: str = "simd"` must
+                             be patched to `"simt_only"`. Conda NPU host uses
+                             force_simt_only=True (pure SIMT/DPX path).
+                             setenv.bash auto-patches on first source.
+
+CRITICAL — without the bitcode files in lib/, kernel compilation
+fails with an IsolatedFromAbove cascade error. This was the root
+cause of multiple lost days in the 206-run. The deploy step now
+copies these files; verify by `ls permanent_pipeline/lib/` after
+deploy.
+
+
+For A5 primary / A5 secondary (docker, both SIMD and SIMT paths) — same bishengir-
+compile / hivmc-a5 / bisheng requirements, but bitcode files live
+alongside the binaries (no separate lib/ dir needed inside the
+container). The deploy-binary.sh script handles this difference
+automatically; both layouts are produced from the same set of files.
+
+
+===============================================================================
+TEST INVOCATION
+===============================================================================
+
+There is ONE active binary set at a time on each machine, defined by
+where `bin-active/` symlinks point. Switching binaries = changing the
+symlink target via `switch_compiler.sh`. No rebuild, no copy.
+
+--- Conda NPU host (conda) ---
+
+  ssh npu-user@conda-npu.example.org
+  bash -lc '
+    source /home/npu-user/permanent_pipeline/scripts/setenv.bash
+    cd /home/npu-user/FlagGems_Ascend
+    pytest tests/test_general_reduction_ops.py::test_accuracy_sum -sv --ref cpu
+  '
+
+  Switch preset:
+    bash /home/npu-user/permanent_pipeline/scripts/switch_compiler.sh bin-rel-dev
+    bash /home/npu-user/permanent_pipeline/scripts/switch_compiler.sh bin-system-reference
+    bash /home/npu-user/permanent_pipeline/scripts/switch_compiler.sh bin-debug-fix-X
+
+  After EVERY switch:  rm -rf ~/.triton/cache/*
+
+--- A5 primary / A5 secondary (docker) ---
+
+  ssh npu-user@a5-primary.example.org
+  docker exec -it ascend_test_env bash -lc '
+    cd /home/npu-user/permanent_pipeline/triton_ascend/test/flaggems_cases/repo
+    rm -rf ~/.triton/cache/*
+    pytest "tests/test_binary_pointwise_ops.py::test_accuracy_add_..." --ref cpu
+  '
+
+  Switch preset:
+    docker exec ascend_test_env \
+      bash /home/npu-user/permanent_pipeline/scripts/switch_compiler.sh bin-rel-dev
+
+
+===============================================================================
+TRITON CACHE — ONE RULE
+===============================================================================
+
+After every binary swap (compiler change, preset switch, deploy):
+  rm -rf ~/.triton/cache/*
+
+This is non-negotiable. Stale Triton cache silently uses the
+previous compiler's IR and masks the change you just deployed.
+Cache-related test failures are nearly always "you forgot this".
+
+
+===============================================================================
+SAVING GENERATED IR FILES
+===============================================================================
+
+When running bishengir-compile / hivmc-a5 with --mlir-print-ir-after-all,
+or when extracting kernel cache IR for a particular test, put the
+output under `.local-artifacts/<task>/gen_ir/<investigation>/` on the
+harness side (or the task's configured artifact_dir, gitignored). Keep only
+the capture/replay commands, settings and conclusions in the task Markdown;
+generated IR must not accumulate in state/. On the remote, use
+`~/permanent_pipeline/gen_ir/<investigation>/`.
+
+Convention per investigation:
+  gen_ir/<investigation_name>/
+    raw/                  full --mlir-print-ir-after-all dumps
+    ttadapter/            inputs pulled from Triton cache
+    diffs/                pass-diffs or minimal reproducers
+    README.md             one-paragraph summary of what's captured
+
+Example (capture IR dumps for the active bishengir-compile binary):
+  ssh npu-user@conda-npu.example.org
+  mkdir -p ~/permanent_pipeline/gen_ir/my_bug/raw
+  ~/permanent_pipeline/bin-active/bishengir-compile kernel.ttadapter.mlir \
+      --target=Ascend950PR_957c --enable-hfusion-compile=true \
+      --enable-triton-kernel-compile=true --mlir-print-ir-after-all \
+      -o /tmp/out.o 2>~/permanent_pipeline/gen_ir/my_bug/raw/bish_dump.log
+
+
+===============================================================================
+MACHINE CONFIGURATION
+===============================================================================
+
+  Select the authorized host in config.local.yaml and record its access
+  details in the ignored login-credentials.txt. See machine-inventory.md
+  before provisioning or using a newly inventoried host.
+
+
+===============================================================================
+BRANCH CONVENTION
+===============================================================================
+
+  AscendNPU-IR-Dev development branch: A5/dev (NOT master)
+  hivmc development branch:            A5/dev
+  All fix branches should be based on the respective A5/dev branch.
+
+
+===============================================================================
+FLAGGEMS TEST LOCATION
+===============================================================================
+
+  In docker (A5 primary/A5 secondary): ${WORKSPACE}/triton_ascend/test/flaggems_cases/repo/
+  In conda (Conda NPU host):      /home/npu-user/FlagGems_Ascend
+  Test file pattern:    tests/test_*.py
+  Source pattern:       src/flag_gems/
+
+
+===============================================================================
+APPENDIX: LEGACY ~/dt_debug/ LAYOUT (pre-permanent-pipeline, archive)
+===============================================================================
+
+The harness used to deploy binaries into per-workspace
+`~/dt_debug/fix_bin/` directories inside live `triton_CI_op_*` CI
+containers. This is replaced by the `permanent_pipeline/` layout
+above. Any reference to `~/dt_debug/` in older logs or scripts
+refers to this archive layout. Do not deploy here for new work.

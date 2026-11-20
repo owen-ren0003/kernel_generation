@@ -1,0 +1,64 @@
+===============================================================================
+Docker Build Environment Setup
+===============================================================================
+
+The Docker container "ascend-build-206" runs Ubuntu 20.04 (glibc 2.31) for
+binary compatibility with all target machines (Conda NPU host, A5 primary, A5 secondary).
+
+Current harness mount:
+
+  /path/to/ascend-workspaces -> /src (inside container)
+
+Workspace paths inside the container are therefore:
+
+  /src/ws1/AscendNPU-IR-Dev
+  /src/ws1/hivmc
+
+=== Starting Docker (after WSL restart) ===
+
+  sudo service docker start
+  docker start ascend-build-206
+  sudo chmod 666 /var/run/docker.sock
+
+=== Verify container is running ===
+
+  docker exec ascend-build-206 echo "OK"
+
+=== Interactive shell (for manual debugging/exploration) ===
+
+  docker exec -it -w /src/ws1 ascend-build-206 bash
+  # Once inside, set up PATH:
+  export PATH=/usr/local/bin:/usr/lib/llvm-17/bin:$PATH
+
+=== Tools available inside container ===
+
+  - clang-17, clang++-17, lld-17: /usr/lib/llvm-17/bin/
+  - cmake 4.3, ninja 1.13: /usr/local/bin/
+  - python3, git
+  - the configured proxy CA installed in trust store
+
+=== Important: Git safe directory ===
+
+  docker exec ascend-build-206 git config --global --add safe.directory '*'
+
+=== Creating container from scratch (if needed) ===
+
+  docker pull ubuntu:20.04
+  docker run -d --name ascend-build-206 \
+    -v /path/to/ascend-workspaces:/src \
+    ubuntu:20.04 sleep infinity
+
+  # Install tools inside:
+  docker exec ascend-build-206 bash -c "
+    apt-get update && apt-get install -y \
+      software-properties-common curl ca-certificates git python3 python3-pip zlib1g-dev
+    # Add LLVM 17 apt repo, install clang-17 lld-17
+    # pip3 install cmake ninja
+  "
+  docker commit ascend-build-206 ascend-build-206-image
+
+=== Checking glibc compatibility of built binaries ===
+
+  objdump -T <binary> | grep GLIBC | \
+    sed 's/.*GLIBC_/GLIBC_/' | sort -t. -k1,1 -k2,2n -k3,3n | uniq | tail -3
+  # Must be <= GLIBC_2.31 for Conda NPU host

@@ -1,0 +1,191 @@
+===============================================================================
+Building AscendNPU-IR-Dev
+===============================================================================
+
+Prerequisites: Docker environment (see docker-setup.txt)
+
+Source: <REPO_ROOT>/AscendNPU-IR-Dev/
+
+  <REPO_ROOT> is the parent directory containing AscendNPU-IR-Dev/ and hivmc/.
+  Current Codex harness layout:
+
+    Host work dir:       /path/to/ascend-workspaces
+    Workspace root:      /path/to/ascend-workspaces/ws1
+    Container mount:     /path/to/ascend-workspaces -> /src
+    In-container repo:   /src/ws1/AscendNPU-IR-Dev
+
+  For ws2/ws3/etc., replace ws1 with the desired workspace name. If using an
+  older one-workspace Docker layout, /src/AscendNPU-IR-Dev may be valid, but
+  for this harness prefer the config.yaml + docker-setup.txt layout above.
+
+=== Branch Convention ===
+
+  AscendNPU-IR-Dev development branch: A5/dev (NOT master)
+  hivmc development branch: A5/dev (may diverge from AscendNPU-IR-Dev naming in the future)
+  master: Old development branch for both repos, may return to it later.
+  All fix branches should be based on the respective A5/dev branch.
+
+=== Build Directories ===
+
+  build-dev/         Release build of A5/dev branch (reference)
+  build-fix/         Release build with our fixes applied
+  build-dev-debug/   Debug build of dev/master branch
+  build-fix-debug/   Debug build with our fixes applied
+
+=== Submodule Setup (first time or after branch change) ===
+
+  cd /src/ws1/AscendNPU-IR-Dev
+  git submodule update --init --recursive --progress
+
+=== Environment Notes ===
+
+  No conda environment is needed inside Docker. The container has:
+    cmake 4.3 and ninja 1.13 at /usr/local/bin/
+    clang-17 at /usr/lib/llvm-17/bin/
+
+  Always set PATH inside the container:
+    export PATH=/usr/local/bin:/usr/lib/llvm-17/bin:$PATH
+
+=== Clean Build (Release) ===
+
+  Preferred from the harness root:
+
+    bash scripts/build-ascend-npu-ir.sh --workspace ws1 --build-type rel \
+      --descriptor dev --force-rebuild
+
+  The wrapper reads config.yaml, uses container ascend-build-206, translates
+  /path/to/ascend-workspaces/ws1 to /src/ws1, and passes -j 16.
+
+  Equivalent raw Docker command:
+
+  docker exec -w /src/ws1/AscendNPU-IR-Dev/<BUILD_DIR> ascend-build-206 bash -c "
+    export PATH=/usr/local/bin:/usr/lib/llvm-17/bin:\$PATH
+    ../build-tools/build.sh --c-compiler clang-17 --cxx-compiler clang++-17 \
+      '--add-cmake-options=-DLLVM_ENABLE_LLD=ON' --build-type Release -j 16 \
+      --enable-assertion --disable-werror --disable-mlir-werror \
+      --disable-bishengir-werror --build-triton --build . --apply-patches"
+
+  Replace <BUILD_DIR> with: build-dev, build-fix, etc.
+  For Debug builds, change --build-type Release to --build-type Debug.
+
+=== Building meta_op.*.bc Templates (added 2026-05-07) ===
+
+  This is REQUIRED if you want to deploy a custom hivmc-a5 binary.
+  hivmc-a5 reads bitcode paths from MLIR module attributes
+  (`hivm::AIC_BITCODEAttr` etc., resolved by Utility.cpp::getBitcodePathsBySubCoreTarget),
+  and those attributes are embedded by bishengir-compile pointing at the
+  meta_op.*.bc files. The .bc files are produced by AscendNPU-IR-Dev's
+  Template subtree (NOT hivmc — they were migrated out of hivmc by commit
+  56e7cd12f "Migrate metaop to bishengir"). The hivmc tree at
+  bishengir/lib/Template/ no longer exists; the live source is at
+  AscendNPU-IR-Dev/bishengir/lib/Template/.
+
+  Default: --build-template is OFF, so meta_op.*.bc are NOT produced.
+  Symptom of forgetting this: custom hivmc-a5 fails at runtime with
+  `[ERROR] cannot find bitcode for coretype 1`.
+
+  To enable, add `--build-template` (short: `-t`) AND
+  `--bisheng-compiler <PATH>` to the clean build command:
+
+    docker exec -w /src/ws1/AscendNPU-IR-Dev/<BUILD_DIR> ascend-build-206 bash -c "
+      export PATH=/usr/local/bin:/usr/lib/llvm-17/bin:\$PATH
+      ../build-tools/build.sh --c-compiler clang-17 --cxx-compiler clang++-17 \
+        '--add-cmake-options=-DLLVM_ENABLE_LLD=ON' --build-type Release -j 16 \
+        --enable-assertion --disable-werror --disable-mlir-werror \
+        --disable-bishengir-werror --build-triton --build . --apply-patches \
+        --build-template \
+        --bisheng-compiler /src/bisheng_compiler/bisheng_compiler/bin"
+
+  Required: BISHENG_COMPILER must point at the directory containing the
+  bisheng binary (NOT the binary itself). The Template CMake walks each
+  kernel-template `.cpp` and invokes
+    bisheng -O2 -x cce -emit-llvm -c <input.cpp> -o <output.bc>
+
+  See extract-bisheng-compiler.txt for how to obtain bisheng_compiler/.
+  Existing extracted folders on this host:
+    /path/to/ascend-workspaces/bisheng_compiler/bisheng_compiler/bin
+
+  Output: meta_op.*.bc files at
+    <BUILD_DIR>/tools/bishengir/lib/Template/meta_op.*.bc
+  (after rename per build-hivmc.txt's "dav-" rule, these become
+   meta_op.aiv.dav-c310.bc etc., matching the runtime lookup paths).
+
+  Verify after build:
+    find <BUILD_DIR>/tools/bishengir/lib/Template -name "meta_op*.bc"
+
+  Should list e.g.:
+    meta_op.aic.c220.bc, meta_op.aic.c310.bc, meta_op.aiv.c220.bc,
+    meta_op.aiv.c310.bc, meta_op.mix.aic.c220.bc, meta_op.mix.aic.c310.bc,
+    meta_op.mix.aiv.c220.bc, meta_op.mix.aiv.c310.bc
+
+  IMPORTANT: --build-template + --bisheng-compiler can ONLY be used
+  with a clean build. If a CMakeCache.txt already exists from a previous
+  configure, BISHENGIR_BUILD_TEMPLATE will stay at its cached value.
+  Delete the build dir or `rm CMakeCache.txt` first.
+
+=== Incremental Build (after source changes) ===
+
+  docker exec -w /src/ws1/AscendNPU-IR-Dev/<BUILD_DIR> ascend-build-206 bash -c "
+    export PATH=/usr/local/bin:/usr/lib/llvm-17/bin:\$PATH
+    touch build.ninja
+    ninja -j16 bin/bishengir-compile"
+
+  NOTE: "touch build.ninja" prevents ninja from re-running cmake.
+  Only use this when you changed .cpp/.h files, NOT CMakeLists.txt or .td files.
+
+=== Output ===
+
+  Binary: /src/AscendNPU-IR-Dev/<BUILD_DIR>/bin/bishengir-compile
+  Release binary: ~120-170 MB
+  Debug binary:   ~1.9 GB (avoid deploying to remote machines)
+
+=== Important Rules ===
+
+  1. NEVER use --apply-patches if patches are already applied. To check:
+       cd third-party/llvm-project && git diff --stat HEAD
+       (If there are changes, patches are already applied — omit --apply-patches)
+     If you MUST re-apply patches, reset submodules first:
+       cd third-party/llvm-project && git reset --hard HEAD && git clean -fdx
+       cd third-party/triton && git reset --hard HEAD && git clean -fdx
+     For incremental builds after source changes, NEVER use --apply-patches.
+
+  2. If CMakeCache.txt is corrupted, delete the entire build directory and rebuild.
+
+  3. The build script uses git rev-parse, so build dir MUST be inside the git repo.
+
+  4. For incremental builds after branch changes, delete CMakeCache.txt and rebuild:
+       rm <BUILD_DIR>/CMakeCache.txt
+       # Then run the full build command (not incremental)
+
+  5. INCREMENTAL BUILDS DON'T PICK UP NEW PATCHES.
+     If `git pull` brings in new files in `build-tools/patches/llvm-project/`
+     (e.g., a new `0008-*.patch`, `0009-*.patch`, ...), the incremental
+     `ninja` build does NOT apply them automatically. Symptoms:
+     compile errors referencing methods/types that don't exist on
+     upstream MLIR/LLVM (e.g. `error: no member named 'getLayout' in
+     'mlir::VectorType'`).
+
+     After a `git pull`, before `ninja`, check for new patches:
+       cd build-tools/patches/llvm-project && ls *.patch
+       cd third-party/llvm-project && git diff --stat HEAD | wc -l
+     If new .patch files exist that aren't applied yet, apply them
+     manually:
+       cd third-party/llvm-project
+       git apply ../../build-tools/patches/llvm-project/<NEW_PATCH>.patch
+     Same procedure for triton patches.
+
+     Real example: 2026-04-29, A5/dev HEAD `bd3e020` shipped with
+     `0008-add-hivm.patch` (extends `mlir::VectorType` with `getLayout()`
+     and 1-arg `cloneWith()`) but the patch wasn't applied to the
+     submodule on initial pull. Build fails at HIVMAVE/Transforms files.
+     Fix: `git apply build-tools/patches/llvm-project/0008-add-hivm.patch`
+     in the submodule dir. After applying, the patched build triggers
+     a near-full MLIR rebuild (1-2 hours at -j8) since core headers changed.
+
+=== Verifying the Build ===
+
+  # Check binary exists and is reasonable size
+  ls -lh <BUILD_DIR>/bin/bishengir-compile
+
+  # Quick smoke test (should print help)
+  docker exec ascend-build-206 /src/ws1/AscendNPU-IR-Dev/<BUILD_DIR>/bin/bishengir-compile --help 2>&1 | head -3
